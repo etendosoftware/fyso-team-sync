@@ -1,6 +1,7 @@
 #!/bin/bash
-# Fyso Team Sync — Usage tracking hook v1.5
+# Fyso Team Sync — Usage tracking hook v2.0
 # Reads hook data from stdin (JSON) and sends to Fyso API
+# Supports: session_start, session_end, agent_dispatch, subagent_start, subagent_stop
 
 CONFIG="$HOME/.fyso/config.json"
 [ ! -f "$CONFIG" ] && exit 0
@@ -94,27 +95,110 @@ if isinstance(tool_input, dict):
     detail = tool_input.get("description", "") or tool_input.get("prompt", "")
     if isinstance(detail, str) and len(detail) > 200:
         detail = detail[:200] + "..."
-if event_type in ("session_start", "session_end"):
-    detail = event_type.replace("_", " ")
-
-# Tokens: extract from tool_response or transcript
-tokens = 0
-if isinstance(tool_response, dict):
-    tokens = tool_response.get("totalTokens", 0) or 0
-    if not tokens:
-        usage = tool_response.get("usage", {})
-        if isinstance(usage, dict):
-            tokens = usage.get("total_tokens", 0) or usage.get("totalTokens", 0) or 0
-            if not tokens:
-                tokens = (usage.get("input_tokens", 0) or 0) + (usage.get("output_tokens", 0) or 0) + (usage.get("cache_read_input_tokens", 0) or 0) + (usage.get("cache_creation_input_tokens", 0) or 0)
-
-# For session_end: parse transcript to sum ALL tokens in the session
-session_tokens = 0
-if event_type == "session_end":
+if event_type == "session_start":
+    detail = "session start"
+elif event_type == "session_end":
+    # Extract a summary from the last assistant message in the transcript
     transcript_path = hook.get("transcript_path", "")
+    summary = ""
     if transcript_path and os.path.exists(transcript_path):
         try:
-            total = 0
+            last_text = ""
+            tools_used = []
+            with open(transcript_path) as tf:
+                for line in tf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        msg = entry.get("message", {})
+                        if not isinstance(msg, dict):
+                            continue
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict):
+                                    if c.get("type") == "tool_use":
+                                        name = c.get("name", "")
+                                        if name and name not in tools_used[-5:]:
+                                            tools_used.append(name)
+                                    if c.get("type") == "text" and msg.get("role") == "assistant":
+                                        t = c.get("text", "").strip()
+                                        if t and len(t) > 10:
+                                            last_text = t
+                    except:
+                        continue
+            # Build summary: last meaningful text + recent tools
+            if last_text:
+                # Take first line, truncate
+                first_line = last_text.split("\n")[0][:120]
+                summary = first_line
+            elif tools_used:
+                summary = "Used: " + ", ".join(tools_used[-5:])
+        except:
+            pass
+    detail = summary if summary else "session end"
+
+# Token breakdown: extract individual token types
+input_tokens = 0
+output_tokens = 0
+cache_creation_tokens = 0
+cache_read_tokens = 0
+model = ""
+message_id = ""
+
+if isinstance(tool_response, dict):
+    usage = tool_response.get("usage", {})
+    if isinstance(usage, dict):
+        input_tokens = usage.get("input_tokens", 0) or 0
+        output_tokens = usage.get("output_tokens", 0) or 0
+        cache_creation_tokens = usage.get("cache_creation_input_tokens", 0) or 0
+        cache_read_tokens = usage.get("cache_read_input_tokens", 0) or 0
+    # Fallback to totalTokens if no breakdown
+    if not (input_tokens or output_tokens):
+        total = tool_response.get("totalTokens", 0) or 0
+        if total:
+            output_tokens = total  # conservative: attribute to output
+
+tokens = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+
+# Message ID for deduplication
+if isinstance(tool_response, dict):
+    message_id = tool_response.get("id", "") or tool_response.get("requestId", "") or ""
+if not message_id and isinstance(hook, dict):
+    message_id = hook.get("requestId", "") or ""
+
+# Model extraction from transcript (last entry with model info)
+transcript_path = hook.get("transcript_path", "")
+if transcript_path and os.path.exists(transcript_path):
+    try:
+        with open(transcript_path) as tf:
+            for line in tf:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    msg = entry.get("message", {})
+                    if isinstance(msg, dict):
+                        m = msg.get("model", "")
+                        if m:
+                            model = m
+                except:
+                    continue
+    except:
+        pass
+
+# For session_end: sum ALL tokens from transcript
+session_tokens = 0
+session_input = 0
+session_output = 0
+session_cache_creation = 0
+session_cache_read = 0
+if event_type == "session_end":
+    if transcript_path and os.path.exists(transcript_path):
+        try:
             with open(transcript_path) as tf:
                 for line in tf:
                     line = line.strip()
@@ -126,14 +210,37 @@ if event_type == "session_end":
                         if isinstance(msg, dict):
                             u = msg.get("usage", {})
                             if isinstance(u, dict):
-                                total += (u.get("input_tokens", 0) or 0) + (u.get("output_tokens", 0) or 0)
+                                session_input += (u.get("input_tokens", 0) or 0)
+                                session_output += (u.get("output_tokens", 0) or 0)
+                                session_cache_creation += (u.get("cache_creation_input_tokens", 0) or 0)
+                                session_cache_read += (u.get("cache_read_input_tokens", 0) or 0)
                     except:
                         continue
-            if total > 0:
-                session_tokens = total
+            session_tokens = session_input + session_output + session_cache_creation + session_cache_read
         except:
             pass
     tokens = 0
+    input_tokens = 0
+    output_tokens = 0
+    cache_creation_tokens = 0
+    cache_read_tokens = 0
+
+# Cost calculation (per 1M tokens)
+PRICING = {
+    "opus":   {"input": 15,   "output": 75,  "cache_write": 18.75, "cache_read": 1.5},
+    "sonnet": {"input": 3,    "output": 15,  "cache_write": 3.75,  "cache_read": 0.3},
+    "haiku":  {"input": 0.8,  "output": 4,   "cache_write": 1.0,   "cache_read": 0.08},
+}
+model_family = "opus" if "opus" in model else "sonnet" if "sonnet" in model else "haiku" if "haiku" in model else ""
+
+def calc_cost(inp, out, cw, cr, family):
+    p = PRICING.get(family)
+    if not p:
+        return 0
+    return (inp / 1e6) * p["input"] + (out / 1e6) * p["output"] + (cw / 1e6) * p["cache_write"] + (cr / 1e6) * p["cache_read"]
+
+cost_usd = calc_cost(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, model_family)
+session_cost_usd = calc_cost(session_input, session_output, session_cache_creation, session_cache_read, model_family) if event_type == "session_end" else 0
 
 # User
 user = user_email or getpass.getuser()
@@ -147,8 +254,21 @@ data = {
     "team_name": team_name or None,
     "user": user or None,
     "session_id": session_id or None,
+    "model": model or None,
+    "model_family": model_family or None,
+    "message_id": message_id or None,
     "tokens": tokens if tokens > 0 else None,
+    "input_tokens": input_tokens if input_tokens > 0 else None,
+    "output_tokens": output_tokens if output_tokens > 0 else None,
+    "cache_creation_tokens": cache_creation_tokens if cache_creation_tokens > 0 else None,
+    "cache_read_tokens": cache_read_tokens if cache_read_tokens > 0 else None,
     "session_tokens": session_tokens if session_tokens > 0 else None,
+    "session_input_tokens": session_input if session_input > 0 else None,
+    "session_output_tokens": session_output if session_output > 0 else None,
+    "session_cache_creation_tokens": session_cache_creation if session_cache_creation > 0 else None,
+    "session_cache_read_tokens": session_cache_read if session_cache_read > 0 else None,
+    "cost_usd": round(cost_usd, 6) if cost_usd > 0 else None,
+    "session_cost_usd": round(session_cost_usd, 6) if session_cost_usd > 0 else None,
     "cwd": hook.get("cwd", os.getcwd()) or None,
     "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
 }

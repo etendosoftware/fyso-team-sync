@@ -101,18 +101,40 @@ detail = " | ".join(parts) if parts else "idle"
 if len(detail) > 200:
     detail = detail[:200]
 
-# Count tokens since session start
+# Count tokens since session start (with breakdown)
 total_tokens = 0
+total_input = 0
+total_output = 0
+total_cache_creation = 0
+total_cache_read = 0
+model = ""
 for line in lines:
     try:
         entry = json.loads(line)
         msg = entry.get("message", {})
         if isinstance(msg, dict):
+            m = msg.get("model", "")
+            if m:
+                model = m
             u = msg.get("usage", {})
             if isinstance(u, dict):
-                total_tokens += (u.get("input_tokens", 0) or 0) + (u.get("output_tokens", 0) or 0)
+                total_input += (u.get("input_tokens", 0) or 0)
+                total_output += (u.get("output_tokens", 0) or 0)
+                total_cache_creation += (u.get("cache_creation_input_tokens", 0) or 0)
+                total_cache_read += (u.get("cache_read_input_tokens", 0) or 0)
     except:
         continue
+total_tokens = total_input + total_output + total_cache_creation + total_cache_read
+
+# Cost calculation (per 1M tokens)
+PRICING = {
+    "opus":   {"input": 15,   "output": 75,  "cache_write": 18.75, "cache_read": 1.5},
+    "sonnet": {"input": 3,    "output": 15,  "cache_write": 3.75,  "cache_read": 0.3},
+    "haiku":  {"input": 0.8,  "output": 4,   "cache_write": 1.0,   "cache_read": 0.08},
+}
+model_family = "opus" if "opus" in model else "sonnet" if "sonnet" in model else "haiku" if "haiku" in model else ""
+p = PRICING.get(model_family, {})
+cost_usd = (total_input / 1e6) * p.get("input", 0) + (total_output / 1e6) * p.get("output", 0) + (total_cache_creation / 1e6) * p.get("cache_write", 0) + (total_cache_read / 1e6) * p.get("cache_read", 0) if p else 0
 
 import urllib.request
 data = {
@@ -121,7 +143,14 @@ data = {
     "team_name": team_name or None,
     "user": user_email or os.environ.get("USER", ""),
     "session_id": session_id or None,
+    "model": model or None,
+    "model_family": model_family or None,
     "tokens": total_tokens if total_tokens > 0 else None,
+    "input_tokens": total_input if total_input > 0 else None,
+    "output_tokens": total_output if total_output > 0 else None,
+    "cache_creation_tokens": total_cache_creation if total_cache_creation > 0 else None,
+    "cache_read_tokens": total_cache_read if total_cache_read > 0 else None,
+    "cost_usd": round(cost_usd, 6) if cost_usd > 0 else None,
     "cwd": cwd or None,
     "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
 }
