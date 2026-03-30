@@ -8,6 +8,5 @@
   },
   "repository": "https://github.com/fyso-dev/fyso-team-sync",
   "license": "MIT",
-  "skills": "./skills/",
-  "hooks": "./hooks/hooks.json"
+  "skills": "./skills/"
 }
