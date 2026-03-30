@@ -55,8 +55,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "kill $(cat ~/.fyso/heartbeat.pid 2>/dev/null) 2>/dev/null; ${CLAUDE_PLUGIN_ROOT}/hooks/tracking.sh session_end",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/tracking.sh session_update",
             "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "kill $(cat ~/.fyso/heartbeat.pid 2>/dev/null) 2>/dev/null; true",
+            "timeout": 2000
           }
         ]
       }

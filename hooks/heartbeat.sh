@@ -128,7 +128,7 @@ total_tokens = total_input + total_output + total_cache_creation + total_cache_r
 
 # Cost calculation (per 1M tokens)
 PRICING = {
-    "opus":   {"input": 15,   "output": 75,  "cache_write": 18.75, "cache_read": 1.5},
+    "opus":   {"input": 15,   "output": 75,  "cache_write": 3.75, "cache_read": 0.375},
     "sonnet": {"input": 3,    "output": 15,  "cache_write": 3.75,  "cache_read": 0.3},
     "haiku":  {"input": 0.8,  "output": 4,   "cache_write": 1.0,   "cache_read": 0.08},
 }
