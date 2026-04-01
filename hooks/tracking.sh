@@ -199,7 +199,7 @@ if transcript_path and os.path.exists(transcript_path):
                         session_cache_read += scr
 
                 # Summary text (for session_end/session_update detail)
-                if event_type in ("session_end", "session_update"):
+                if event_type in ("session_end", "session_update", "usage_limit_hit"):
                     content = msg.get("content", [])
                     if isinstance(content, list):
                         for c in content:
@@ -228,8 +228,24 @@ if transcript_path and os.path.exists(transcript_path):
 if not model:
     model = "claude-opus-4-6"
 
+# Detect usage/rate limit events and override event_type
+# 1. Usage limit: Stop hook exposes last_assistant_message with known text
+if event_type == "session_update":
+    last_msg = hook.get("last_assistant_message", "") or ""
+    if isinstance(last_msg, str) and any(kw in last_msg.lower() for kw in ("usage limit reached", "out of extra usage", "you've reached your usage", "usage limit")):
+        event_type = "usage_limit_hit"
+
+# 2. Rate limit / overloaded: tool_response contains an error object (PostToolUse)
+if event_type == "agent_dispatch":
+    if isinstance(tool_response, dict) and tool_response.get("type") == "error":
+        err_type = (tool_response.get("error") or {}).get("type", "")
+        if err_type == "rate_limit_error":
+            event_type = "rate_limit_hit"
+        elif err_type == "overloaded_error":
+            event_type = "overloaded_hit"
+
 # Build detail for session_end/session_update
-if event_type in ("session_end", "session_update"):
+if event_type in ("session_end", "session_update", "usage_limit_hit"):
     if _last_text:
         _summary = _last_text.split("\n")[0][:120]
     elif _tools_used:
