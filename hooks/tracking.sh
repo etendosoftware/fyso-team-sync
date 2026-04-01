@@ -138,6 +138,10 @@ session_cache_read = 0
 _summary = ""
 
 if transcript_path and os.path.exists(transcript_path):
+    # Wait for Claude to finish writing the JSONL before reading it
+    if event_type in ("session_update", "session_end"):
+        import time
+        time.sleep(1)
     debug_log = os.path.expanduser("~/.fyso/debug")
     is_debug = os.path.exists(debug_log)
     _last_text = ""
@@ -145,6 +149,7 @@ if transcript_path and os.path.exists(transcript_path):
     _line_count = 0
     _usage_count = 0
     _model_count = 0
+    _seen_hashes = {}
     try:
         with open(transcript_path, encoding="utf-8", errors="replace") as tf:
             for raw_line in tf:
@@ -166,7 +171,7 @@ if transcript_path and os.path.exists(transcript_path):
                     model = m
                     _model_count += 1
 
-                # Usage (accumulate for session totals)
+                # Usage (accumulate for session totals, deduplicated by message.id:requestId)
                 u = msg.get("usage", {})
                 if isinstance(u, dict) and u:
                     si = u.get("input_tokens", 0) or 0
@@ -174,6 +179,19 @@ if transcript_path and os.path.exists(transcript_path):
                     scw = u.get("cache_creation_input_tokens", 0) or 0
                     scr = u.get("cache_read_input_tokens", 0) or 0
                     if si or so or scw or scr:
+                        msg_id = msg.get("id", "")
+                        req_id = entry.get("requestId", "")
+                        if msg_id and req_id:
+                            hash_key = f"{msg_id}:{req_id}"
+                            if hash_key in _seen_hashes:
+                                # Last-wins: subtract previous and replace with updated values
+                                prev = _seen_hashes[hash_key]
+                                session_input -= prev[0]
+                                session_output -= prev[1]
+                                session_cache_creation -= prev[2]
+                                session_cache_read -= prev[3]
+                                _usage_count -= 1
+                            _seen_hashes[hash_key] = (si, so, scw, scr)
                         _usage_count += 1
                         session_input += si
                         session_output += so
