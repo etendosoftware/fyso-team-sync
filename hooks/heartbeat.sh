@@ -28,7 +28,7 @@ while true; do
   [ ! -f "$TRANSCRIPT" ] && break
 
   python3 << 'PYEOF'
-import json, os, sys, datetime
+import json, os, sys, datetime, subprocess
 
 config_path = os.path.expanduser("~/.fyso/config.json")
 try:
@@ -47,6 +47,17 @@ try:
 except:
     pass
 user_email = cfg.get("user_email", "")
+
+claude_account = ""
+try:
+    result = subprocess.run(
+        ["claude", "auth", "status", "--json"],
+        capture_output=True, text=True, timeout=3
+    )
+    if result.returncode == 0:
+        claude_account = json.loads(result.stdout).get("email", "")
+except Exception:
+    pass
 session_id = os.environ.get("SESSION_ID", "")
 transcript = os.environ.get("TRANSCRIPT", "")
 cwd = os.environ.get("CWD", "")
@@ -142,6 +153,7 @@ data = {
     "detail": detail,
     "team_name": team_name or None,
     "user": user_email or os.environ.get("USER", ""),
+    "claude_account": claude_account or None,
     "session_id": session_id or None,
     "model": model or None,
     "model_family": model_family or None,
