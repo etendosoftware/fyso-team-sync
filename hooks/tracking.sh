@@ -23,7 +23,7 @@ fi
 # Single python call: read config + parse stdin + build payload + send
 export TMPFILE EVENT_TYPE
 python3 << 'PYEOF'
-import json, re, datetime, os, sys, getpass, hashlib
+import json, re, datetime, os, sys, getpass, hashlib, subprocess
 try:
     import urllib.request
 except:
@@ -230,6 +230,19 @@ model_family = "opus" if "opus" in model else "sonnet" if "sonnet" in model else
 # User
 user = user_email or getpass.getuser()
 
+# Claude account email (which Claude account is active in this session)
+claude_account = ""
+try:
+    result = subprocess.run(
+        ["claude", "auth", "status", "--json"],
+        capture_output=True, text=True, timeout=3
+    )
+    if result.returncode == 0:
+        auth_info = json.loads(result.stdout)
+        claude_account = auth_info.get("email", "")
+except Exception:
+    pass
+
 # Build payload
 data = {
     "event": event_type,
@@ -238,6 +251,7 @@ data = {
     "detail": detail or None,
     "team_name": team_name or None,
     "user": user or None,
+    "claude_account": claude_account or None,
     "session_id": session_id or None,
     "model": model or None,
     "model_family": model_family or None,
