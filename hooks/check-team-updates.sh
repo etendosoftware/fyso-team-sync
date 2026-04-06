@@ -2,11 +2,23 @@
 # check-team-updates.sh — Check if the synced Fyso team has a new version.
 # Runs on SessionStart. Exits silently if no team is synced or no credentials.
 
-TEAM_FILE="${PWD}/.fyso/team.json"
 CONFIG_FILE="${HOME}/.fyso/config.json"
-
-[ -f "$TEAM_FILE" ] || exit 0
 [ -f "$CONFIG_FILE" ] || exit 0
+
+# Find .fyso/team.json by traversing up from CLAUDE_PROJECT_DIR or PWD
+find_team_json() {
+  local dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+  while [ "$dir" != "/" ] && [ -n "$dir" ]; do
+    if [ -f "$dir/.fyso/team.json" ]; then
+      echo "$dir/.fyso/team.json"
+      return 0
+    fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+TEAM_FILE=$(find_team_json) || exit 0
 
 LOCAL_VERSION=$(python3 -c "import json; d=json.load(open('$TEAM_FILE')); print(d.get('version', 0))" 2>/dev/null || echo "0")
 TEAM_ID=$(python3 -c "import json; d=json.load(open('$TEAM_FILE')); print(d.get('team_id', ''))" 2>/dev/null || echo "")
