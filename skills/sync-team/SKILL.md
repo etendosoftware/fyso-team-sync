@@ -105,7 +105,9 @@ curl -s "https://api.fyso.dev/api/entities/teams/records" \
   -H "X-Tenant-ID: fyso-world-fcecd"
 ```
 
-Parse the JSON response. The records are in `data.items`. Each team has at least `id`, `name`, and optionally `prompt`.
+Parse the JSON response. The records are in `data.items`. Each team has at least `id`, `name`, and optionally `prompt` and `version`.
+
+**Important**: The API response may include an internal field `_record_version` (number of times the record was modified). Do NOT use this. The team's changelog version is in the `version` field.
 
 ## Step 4 — Let the user pick a team
 
@@ -121,10 +123,12 @@ mkdir -p .fyso
 {
   "team_id": "{TEAM_ID}",
   "team_name": "{TEAM_NAME}",
-  "version": {TEAM_VERSION_OR_0},
+  "version": {TEAM_VERSION_FIELD_OR_0},
   "synced_at": "{ISO_TIMESTAMP}"
 }
 ```
+
+Where `{TEAM_VERSION_FIELD_OR_0}` is the value of the team's `version` field (e.g. `1`, `2`, `3`). Use `0` if the field is absent or null. **Do not use `_record_version`** — that is an internal system counter, not the changelog version.
 
 ## Step 5 — Write team prompt to CLAUDE.md
 
