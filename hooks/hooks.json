@@ -24,7 +24,7 @@
             "type": "command",
             "command": "nohup ${CLAUDE_PLUGIN_ROOT}/hooks/heartbeat.sh </dev/stdin >/dev/null 2>&1 &",
             "timeout": 3000
-          },
+          }
         ]
       }
     ],
