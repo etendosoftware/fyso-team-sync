@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
-# check-team-updates.sh — Asks Claude to verify team version via Fyso MCP.
+# check-team-updates.sh — Checks if the synced Fyso team has a newer version.
 # Runs once per session on UserPromptSubmit.
-# Outputs an instruction string that Claude Code injects as context before
-# processing the user's message — Claude then checks the version with MCP.
+# Outputs a notification to Claude if a newer version is available in the API.
 
-# Run only once per Claude Code session (PPID = PID of the Claude process)
-FLAG_FILE="/tmp/fyso-version-check-${PPID}"
+CONFIG="$HOME/.fyso/config.json"
+[ ! -f "$CONFIG" ] && exit 0
+
+# Read session_id from stdin (Claude Code sends JSON payload via stdin)
+TMPFILE=$(mktemp)
+cat > "$TMPFILE" 2>/dev/null || true
+SESSION_ID=$(python3 -c "
+import sys, json
+try:
+    d = json.loads(open('$TMPFILE').read().strip())
+    print(d.get('session_id', ''))
+except: print('')
+" 2>/dev/null)
+rm -f "$TMPFILE"
+
+# Run only once per Claude Code session (keyed on session_id)
+if [ -n "$SESSION_ID" ]; then
+  FLAG_FILE="/tmp/fyso-version-check-${SESSION_ID}"
+else
+  FLAG_FILE="/tmp/fyso-version-check-${PPID}"
+fi
 [ -f "$FLAG_FILE" ] && exit 0
 touch "$FLAG_FILE"
 
@@ -24,15 +42,57 @@ find_team_json() {
 
 TEAM_FILE=$(find_team_json) || exit 0
 
-TEAM_ID=$(python3 -c "import json; print(json.load(open('$TEAM_FILE')).get('team_id', ''))" 2>/dev/null || echo "")
-[ -z "$TEAM_ID" ] && exit 0
+export TEAM_FILE
+python3 << 'PYEOF'
+import json, os, sys, urllib.request
 
-LOCAL_VERSION=$(python3 -c "import json; print(json.load(open('$TEAM_FILE')).get('version', 0))" 2>/dev/null || echo "0")
-TEAM_NAME=$(python3 -c "import json; print(json.load(open('$TEAM_FILE')).get('team_name', 'el equipo'))" 2>/dev/null || echo "el equipo")
+config_path = os.path.expanduser("~/.fyso/config.json")
+try:
+    cfg = json.load(open(config_path))
+except Exception:
+    sys.exit(0)
 
-# Output an instruction for Claude to check the version via MCP.
-# Claude Code injects this stdout into the conversation context before
-# processing the user's message.
-echo "[fyso-team-sync] Este proyecto tiene un equipo Fyso sincronizado: \"${TEAM_NAME}\" (team_id: ${TEAM_ID}, versión local: v${LOCAL_VERSION}). Antes de responder al usuario, consultá silenciosamente con Fyso MCP (fyso_data → get_record en la entidad 'teams', id: ${TEAM_ID}) si hay una versión más nueva. Si la versión remota es mayor a v${LOCAL_VERSION}, informá al usuario en una línea y sugerí que corra /sync-team. Si es la misma versión o no podés consultarlo, no menciones nada."
+token = cfg.get("token", "")
+tenant = cfg.get("tenant_id", "")
+api_url = cfg.get("api_url", "https://api.fyso.dev")
+
+if not token or not tenant:
+    sys.exit(0)
+
+team_file = os.environ.get("TEAM_FILE", "")
+try:
+    team = json.load(open(team_file))
+    team_id = team.get("team_id", "")
+    team_name = team.get("team_name", "")
+    local_version = int(team.get("version", 0))
+except Exception:
+    sys.exit(0)
+
+if not team_id:
+    sys.exit(0)
+
+try:
+    req = urllib.request.Request(
+        f"{api_url}/api/entities/teams/records/{team_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-ID": tenant,
+        },
+        method="GET",
+    )
+    resp = urllib.request.urlopen(req, timeout=4)
+    data = json.loads(resp.read().decode())
+    remote_version = int((data.get("data") or data).get("version", local_version))
+except Exception:
+    sys.exit(0)
+
+if remote_version > local_version:
+    print(
+        f"[fyso-team-sync] Hay una nueva versión del equipo \"{team_name}\" disponible "
+        f"(local: v{local_version}, remota: v{remote_version}). "
+        f"IMPORTANTE: antes de responder al usuario, avisale en una línea que hay una actualización "
+        f"disponible y que puede correr /sync-team para actualizar los agentes locales."
+    )
+PYEOF
 
 exit 0

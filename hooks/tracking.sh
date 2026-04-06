@@ -301,7 +301,7 @@ data = {
     "session_cache_creation_tokens": session_cache_creation,
     "session_cache_read_tokens": session_cache_read,
     "cwd": hook.get("cwd", os.getcwd()) or None,
-    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
 }
 data = {k: v for k, v in data.items() if v is not None}
 payload = json.dumps(data).encode()

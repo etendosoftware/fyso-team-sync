@@ -22,7 +22,7 @@
           },
           {
             "type": "command",
-            "command": "nohup ${CLAUDE_PLUGIN_ROOT}/hooks/heartbeat.sh </dev/stdin >/dev/null 2>&1 &",
+            "command": "tmpf=$(mktemp /tmp/fyso-hb-XXXXXX.json); cat > \"$tmpf\" 2>/dev/null; nohup ${CLAUDE_PLUGIN_ROOT}/hooks/heartbeat.sh \"$tmpf\" >/dev/null 2>&1 &",
             "timeout": 3000
           }
         ]

@@ -6,8 +6,14 @@
 CONFIG="$HOME/.fyso/config.json"
 [ ! -f "$CONFIG" ] && exit 0
 
-# Read session info from stdin (SessionStart JSON)
-STDIN_DATA=$(cat 2>/dev/null || true)
+# Read session info from temp file passed as $1 (avoids holding the hook stdin pipe open)
+DATAFILE="${1:-}"
+if [ -n "$DATAFILE" ] && [ -f "$DATAFILE" ]; then
+  STDIN_DATA=$(cat "$DATAFILE" 2>/dev/null || true)
+  rm -f "$DATAFILE" 2>/dev/null
+else
+  STDIN_DATA=$(cat 2>/dev/null || true)
+fi
 
 SESSION_ID=$(echo "$STDIN_DATA" | python3 -c "import sys,json; print(json.loads(sys.stdin.read().strip()).get('session_id',''))" 2>/dev/null)
 TRANSCRIPT=$(echo "$STDIN_DATA" | python3 -c "import sys,json; print(json.loads(sys.stdin.read().strip()).get('transcript_path',''))" 2>/dev/null)
@@ -164,7 +170,7 @@ data = {
     "cache_read_tokens": total_cache_read if total_cache_read > 0 else None,
     "cost_usd": round(cost_usd, 6) if cost_usd > 0 else None,
     "cwd": cwd or None,
-    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
 }
 data = {k: v for k, v in data.items() if v is not None}
 
