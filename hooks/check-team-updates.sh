@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # check-team-updates.sh — Check if the synced Fyso team has a new version.
-# Runs on SessionStart. Exits silently if no team is synced or no credentials.
+# Runs on UserPromptSubmit. Uses a PPID-based flag to run only once per session.
+
+# Run only once per Claude Code session (PPID = PID of the Claude process)
+FLAG_FILE="/tmp/fyso-version-check-${PPID}"
+[ -f "$FLAG_FILE" ] && exit 0
+touch "$FLAG_FILE"
 
 CONFIG_FILE="${HOME}/.fyso/config.json"
 [ -f "$CONFIG_FILE" ] || exit 0

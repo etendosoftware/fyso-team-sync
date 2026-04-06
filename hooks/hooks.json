@@ -25,6 +25,12 @@
             "command": "nohup ${CLAUDE_PLUGIN_ROOT}/hooks/heartbeat.sh </dev/stdin >/dev/null 2>&1 &",
             "timeout": 3000
           },
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/check-team-updates.sh",
