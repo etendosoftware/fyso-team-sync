@@ -121,6 +121,7 @@ mkdir -p .fyso
 {
   "team_id": "{TEAM_ID}",
   "team_name": "{TEAM_NAME}",
+  "version": {TEAM_VERSION_OR_0},
   "synced_at": "{ISO_TIMESTAMP}"
 }
 ```
@@ -266,7 +267,8 @@ After creating all files, print a summary:
 - How many agent files were created, with their full paths
 - How many skill files were created, with their full paths (or "no skills found" if none)
 - That global credentials were saved to `~/.fyso/config.json`
-- That team info was saved to `.fyso/team.json`
+- That team info was saved to `.fyso/team.json` (including the current version)
 - A reminder that the user can now use these agents as subagents in Claude Code via the Task tool or by referencing them
+- A note that at the start of each future session, Claude Code will automatically check if the team has a new version and notify the user to re-sync if needed
 
 If no agents were found for the selected team, inform the user and suggest they check the team configuration in the Fyso dashboard at https://agent-ui-sites.fyso.dev.
