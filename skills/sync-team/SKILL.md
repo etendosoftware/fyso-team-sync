@@ -217,13 +217,54 @@ The match should be case-insensitive and partial (e.g. "Senior Developer" matche
 
 For `first_line_of_soul`: take the first non-empty line of the `soul` field, trimmed. If soul is empty, use the display_name instead.
 
-## Step 9 — Report results
+## Step 9 — Fetch team skills
+
+Using the selected team's `id`, fetch the skills assigned to that team:
+
+```
+curl -s "https://api.fyso.dev/api/entities/team_skills/records?filter.team={TEAM_ID}" \
+  -H "Authorization: Bearer {TOKEN}" \
+  -H "X-Tenant-ID: fyso-world-fcecd"
+```
+
+The response contains records in `data.items`. Each skill has:
+
+- `name` — slug/identifier (e.g. `git-workflow`)
+- `description` — one-line summary (may be empty)
+- `content` — full body in Markdown
+
+If the response returns zero items, skip to Step 11 and note that no skills were found.
+
+## Step 10 — Create skill files
+
+First, ensure the `.claude/skills/` directory exists in the current working directory:
+
+```bash
+mkdir -p .claude/skills
+```
+
+For each skill, delete any existing file with the same name and create a new one at `.claude/skills/{name}.md`. Use the Write tool with this exact format:
+
+```markdown
+---
+name: {name}
+description: {description}
+---
+
+{content}
+```
+
+If `description` is empty, write an empty string for that field (keep the frontmatter key).
+
+IMPORTANT: Include the FULL `content` field exactly as received from the API. Do NOT truncate, summarize, or modify it.
+
+## Step 11 — Report results
 
 After creating all files, print a summary:
 
 - Whether the team prompt was written to `.claude/CLAUDE.md`
-- How many agent files were created
-- The full path of each file created
+- How many agent files were created, with their full paths
+- How many skill files were created, with their full paths (or "no skills found" if none)
 - That global credentials were saved to `~/.fyso/config.json`
 - That team info was saved to `.fyso/team.json`
 - A reminder that the user can now use these agents as subagents in Claude Code via the Task tool or by referencing them
