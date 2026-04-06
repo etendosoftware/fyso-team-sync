@@ -230,9 +230,49 @@ if not model:
 
 # Detect usage/rate limit events and override event_type
 # 1. Usage limit: Stop hook exposes last_assistant_message with known text
+USAGE_LIMIT_KEYWORDS = (
+    "usage limit reached", "out of extra usage", "you've reached your usage",
+    "usage limit", "you're out of", "limit has been reached", "no remaining",
+    "out of claude", "monthly usage", "plan limit", "tokens remaining",
+    "run out of", "exhausted your", "quota exceeded", "quota has been",
+)
+
 if event_type == "session_update":
     last_msg = hook.get("last_assistant_message", "") or ""
-    if isinstance(last_msg, str) and any(kw in last_msg.lower() for kw in ("usage limit reached", "out of extra usage", "you've reached your usage", "usage limit")):
+    # Debug: always log last_assistant_message so we can diagnose missed detections
+    if os.path.exists(os.path.expanduser("~/.fyso/debug")):
+        log_path = os.path.expanduser("~/.fyso/hook-debug.log")
+        with open(log_path, "a") as dl:
+            dl.write(f"LAST_ASSISTANT_MESSAGE: {repr(last_msg[:300])}\n")
+
+    hit = isinstance(last_msg, str) and any(kw in last_msg.lower() for kw in USAGE_LIMIT_KEYWORDS)
+
+    # Fallback: scan transcript for usage limit messages if last_assistant_message didn't match
+    if not hit and transcript_path and os.path.exists(transcript_path):
+        try:
+            with open(transcript_path, encoding="utf-8", errors="replace") as tf:
+                for raw_line in tf:
+                    try:
+                        entry = json.loads(raw_line.strip())
+                        msg = entry.get("message", {})
+                        if not isinstance(msg, dict):
+                            continue
+                        content = msg.get("content", [])
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    txt = (c.get("text", "") or "").lower()
+                                    if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
+                                        hit = True
+                                        break
+                        if hit:
+                            break
+                    except:
+                        continue
+        except:
+            pass
+
+    if hit:
         event_type = "usage_limit_hit"
 
 # 2. Rate limit / overloaded: tool_response contains an error object (PostToolUse)
