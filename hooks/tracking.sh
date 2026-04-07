@@ -239,14 +239,22 @@ USAGE_LIMIT_KEYWORDS = (
 
 # Handle UserPromptSubmit: detect usage limit from <synthetic> entries in transcript
 # Fires on the 2nd blocked message (1st synthetic already written to transcript)
+if os.path.exists(os.path.expanduser("~/.fyso/debug")):
+    open(os.path.expanduser("~/.fyso/hook-debug.log"), "a").write(f"REACHED_HANDLER: event_type={repr(event_type)} model={repr(model)}\n")
 if event_type == "usage_limit_check":
     flag_file = f"/tmp/fyso-limit-hit-{session_id}"
+    _dbg = os.path.exists(os.path.expanduser("~/.fyso/debug"))
+    _dbg_log = os.path.expanduser("~/.fyso/hook-debug.log")
     if session_id and os.path.exists(flag_file):
+        if _dbg:
+            open(_dbg_log, "a").write(f"LIMIT_CHECK: flag exists, skipping\n")
         sys.exit(0)
     hit = False
     if transcript_path and os.path.exists(transcript_path):
         try:
             lines = open(transcript_path, encoding="utf-8", errors="replace").readlines()
+            if _dbg:
+                open(_dbg_log, "a").write(f"LIMIT_CHECK: scanning {len(lines)} lines\n")
             for raw_line in lines[-50:]:
                 try:
                     entry = json.loads(raw_line.strip())
@@ -254,12 +262,19 @@ if event_type == "usage_limit_check":
                     if not isinstance(msg, dict): continue
                     if msg.get("model") != "<synthetic>": continue
                     content = msg.get("content", "")
-                    txt = (content if isinstance(content, str) else "").lower()
+                    if isinstance(content, list):
+                        txt = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text").lower()
+                    else:
+                        txt = (content if isinstance(content, str) else "").lower()
+                    if _dbg:
+                        open(_dbg_log, "a").write(f"LIMIT_CHECK: synthetic found txt={repr(txt[:100])}\n")
                     if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
                         hit = True
                         break
                 except: continue
         except: pass
+    if _dbg:
+        open(_dbg_log, "a").write(f"LIMIT_CHECK: hit={hit}\n")
     if not hit:
         sys.exit(0)
     if session_id:
@@ -271,6 +286,9 @@ if event_type == "usage_limit_check":
         if r.returncode == 0:
             ca = json.loads(r.stdout).get("email", "")
     except: pass
+    # model may be "<synthetic>" if transcript only has blocked responses — normalize it
+    if not model or model == "<synthetic>":
+        model = "claude-opus-4-6"
     mf = "opus" if "opus" in model else "sonnet" if "sonnet" in model else "haiku" if "haiku" in model else "opus"
     d = {
         "event": "usage_limit_hit",
@@ -280,11 +298,22 @@ if event_type == "usage_limit_check":
         "claude_account": ca or None,
         "model": model or "claude-opus-4-6",
         "model_family": mf,
+        "tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
         "session_tokens": session_tokens,
+        "session_input_tokens": session_input,
+        "session_output_tokens": session_output,
+        "session_cache_creation_tokens": session_cache_creation,
+        "session_cache_read_tokens": session_cache_read,
         "cwd": hook.get("cwd", os.getcwd()) or None,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     d = {k: v for k, v in d.items() if v is not None}
+    if _dbg:
+        open(_dbg_log, "a").write(f"LIMIT_CHECK: sending payload user={d.get('user')} ca={d.get('claude_account')} session={d.get('session_id','')[:8]}\n")
     try:
         req = urllib.request.Request(
             f"{api_url}/api/entities/tracking/records",
@@ -292,24 +321,21 @@ if event_type == "usage_limit_check":
             headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant, "Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=5)
-    except: pass
+        resp = urllib.request.urlopen(req, timeout=5)
+        if _dbg:
+            open(_dbg_log, "a").write(f"LIMIT_CHECK: sent OK {resp.status}\n")
+    except Exception as e:
+        if _dbg:
+            open(_dbg_log, "a").write(f"LIMIT_CHECK: send error {e}\n")
     sys.exit(0)
 
 if event_type == "session_update":
-    last_msg = hook.get("last_assistant_message", "") or ""
-    # Debug: always log last_assistant_message so we can diagnose missed detections
-    if os.path.exists(os.path.expanduser("~/.fyso/debug")):
-        log_path = os.path.expanduser("~/.fyso/hook-debug.log")
-        with open(log_path, "a") as dl:
-            dl.write(f"LAST_ASSISTANT_MESSAGE: {repr(last_msg[:300])}\n")
+    hit = False
 
-    hit = isinstance(last_msg, str) and any(kw in last_msg.lower() for kw in USAGE_LIMIT_KEYWORDS)
-
-    # Fallback: scan last 50 transcript entries for <synthetic> limit messages only.
-    # Using model="<synthetic>" filter avoids false positives from assistant text.
-    # Also skip if UserPromptSubmit already detected and flagged this session.
-    if not hit and transcript_path and os.path.exists(transcript_path):
+    # Only detect usage limit via <synthetic> transcript entries.
+    # last_assistant_message is NOT used: it contains the real assistant's text, which
+    # can mention limit-related phrases innocuously and cause false positives.
+    if transcript_path and os.path.exists(transcript_path):
         flag_file = f"/tmp/fyso-limit-hit-{session_id}"
         if not (session_id and os.path.exists(flag_file)):
             try:
