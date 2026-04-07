@@ -66,6 +66,17 @@
         ]
       }
     ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/tracking.sh stop_failure",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

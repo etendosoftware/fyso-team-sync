@@ -1,7 +1,7 @@
 #!/bin/bash
 # Fyso Team Sync — Usage tracking hook v2.0
 # Reads hook data from stdin (JSON) and sends to Fyso API
-# Supports: session_start, session_end, agent_dispatch, subagent_start, subagent_stop
+# Supports: session_start, session_end, agent_dispatch, subagent_start, subagent_stop, stop_failure
 
 CONFIG="$HOME/.fyso/config.json"
 [ ! -f "$CONFIG" ] && exit 0
@@ -98,6 +98,39 @@ if isinstance(tool_input, dict):
         detail = detail[:200] + "..."
 if event_type == "session_start":
     detail = "session start"
+    # Check if a previous session in this project has an unreported usage limit hit.
+    # Runs as background process to avoid the 5s hook timeout.
+    _bg_params = {
+        "transcript_dir": os.path.dirname(hook.get("transcript_path", "")),
+        "session_id": session_id,
+        "api_url": api_url,
+        "token": token,
+        "tenant": tenant,
+        "user_email": user_email,
+        "cwd": hook.get("cwd", os.getcwd()),
+    }
+    _bg_script = os.path.join(os.environ.get("CLAUDE_PLUGIN_ROOT", ""), "hooks", "check-prev-limit.py")
+    if not os.path.exists(_bg_script):
+        _bg_script = os.path.expanduser("~/.fyso/check-prev-limit.py")
+    is_debug = os.path.exists(os.path.expanduser("~/.fyso/debug"))
+    if is_debug:
+        open(os.path.expanduser("~/.fyso/hook-debug.log"), "a").write(f"SESSION_START_LAUNCH: transcript_dir={_bg_params['transcript_dir']} script_exists={os.path.exists(_bg_script)}\n")
+    if _bg_params["transcript_dir"] and os.path.exists(_bg_script):
+        _bg_params_file = f"/tmp/fyso-bg-check-{session_id}.json"
+        try:
+            with open(_bg_params_file, "w") as _bf:
+                json.dump(_bg_params, _bf)
+            subprocess.Popen(
+                [sys.executable, "-c",
+                 f"import json,os;P=json.load(open('{_bg_params_file}'));exec(open('{_bg_script}').read())"],
+                stdout=subprocess.DEVNULL,
+                stderr=open(os.path.expanduser("~/.fyso/bg-check-err.log"), "a"),
+            )
+            if is_debug:
+                open(os.path.expanduser("~/.fyso/hook-debug.log"), "a").write("SESSION_START_LAUNCH: Popen OK\n")
+        except Exception as _e:
+            if is_debug:
+                open(os.path.expanduser("~/.fyso/hook-debug.log"), "a").write(f"SESSION_START_LAUNCH: error {_e}\n")
 
 # Token breakdown: extract individual token types from tool_response
 input_tokens = 0
@@ -237,8 +270,77 @@ USAGE_LIMIT_KEYWORDS = (
     "run out of", "exhausted your", "quota exceeded", "quota has been",
 )
 
+# Handle StopFailure: immediate detection of usage/billing limit via API error
+# Fires on the FIRST blocked message — no second prompt needed
+if event_type == "stop_failure":
+    error_type = hook.get("error_type", "")
+    error_message = hook.get("error_message", "") or hook.get("error", "")
+    _dbg = os.path.exists(os.path.expanduser("~/.fyso/debug"))
+    _dbg_log = os.path.expanduser("~/.fyso/hook-debug.log")
+    if _dbg:
+        open(_dbg_log, "a").write(f"STOP_FAILURE: error_type={repr(error_type)} error_message={repr(str(error_message)[:200])}\n")
+    # Deduplicate: skip if already detected for this session
+    flag_file = f"/tmp/fyso-limit-hit-{session_id}"
+    if session_id and os.path.exists(flag_file):
+        if _dbg:
+            open(_dbg_log, "a").write(f"STOP_FAILURE: flag exists, skipping\n")
+        sys.exit(0)
+    # Create flag file to prevent duplicate detection (also blocks usage_limit_check fallback)
+    if session_id:
+        try: open(flag_file, 'w').close()
+        except: pass
+    # Get claude account
+    ca = ""
+    try:
+        r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            ca = json.loads(r.stdout).get("email", "")
+    except: pass
+    # Normalize model
+    if not model or model == "<synthetic>":
+        model = "claude-opus-4-6"
+    mf = "opus" if "opus" in model else "sonnet" if "sonnet" in model else "haiku" if "haiku" in model else "opus"
+    d = {
+        "event": "usage_limit_hit",
+        "detail": f"stop_failure: {error_type}" + (f" - {str(error_message)[:100]}" if error_message else ""),
+        "user": user_email or getpass.getuser(),
+        "session_id": session_id or None,
+        "claude_account": ca or None,
+        "model": model or "claude-opus-4-6",
+        "model_family": mf,
+        "tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_tokens": 0,
+        "cache_read_tokens": 0,
+        "session_tokens": session_tokens,
+        "session_input_tokens": session_input,
+        "session_output_tokens": session_output,
+        "session_cache_creation_tokens": session_cache_creation,
+        "session_cache_read_tokens": session_cache_read,
+        "cwd": hook.get("cwd", os.getcwd()) or None,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    d = {k: v for k, v in d.items() if v is not None}
+    if _dbg:
+        open(_dbg_log, "a").write(f"STOP_FAILURE: sending payload user={d.get('user')} ca={d.get('claude_account')} session={d.get('session_id','')[:8]}\n")
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/api/entities/tracking/records",
+            data=json.dumps(d).encode(),
+            headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant, "Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        if _dbg:
+            open(_dbg_log, "a").write(f"STOP_FAILURE: sent OK {resp.status}\n")
+    except Exception as e:
+        if _dbg:
+            open(_dbg_log, "a").write(f"STOP_FAILURE: send error {e}\n")
+    sys.exit(0)
+
 # Handle UserPromptSubmit: detect usage limit from <synthetic> entries in transcript
-# Fires on the 2nd blocked message (1st synthetic already written to transcript)
+# Fires on the 2nd blocked message — kept as FALLBACK if StopFailure doesn't fire
 if os.path.exists(os.path.expanduser("~/.fyso/debug")):
     open(os.path.expanduser("~/.fyso/hook-debug.log"), "a").write(f"REACHED_HANDLER: event_type={repr(event_type)} model={repr(model)}\n")
 if event_type == "usage_limit_check":
@@ -347,7 +449,10 @@ if event_type == "session_update":
                         if not isinstance(msg, dict): continue
                         if msg.get("model") != "<synthetic>": continue
                         content = msg.get("content", "")
-                        txt = (content if isinstance(content, str) else "").lower()
+                        if isinstance(content, list):
+                            txt = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text").lower()
+                        else:
+                            txt = (content if isinstance(content, str) else "").lower()
                         if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
                             hit = True
                             break
