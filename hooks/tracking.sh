@@ -237,6 +237,65 @@ USAGE_LIMIT_KEYWORDS = (
     "run out of", "exhausted your", "quota exceeded", "quota has been",
 )
 
+# Handle UserPromptSubmit: detect usage limit from <synthetic> entries in transcript
+# Fires on the 2nd blocked message (1st synthetic already written to transcript)
+if event_type == "usage_limit_check":
+    flag_file = f"/tmp/fyso-limit-hit-{session_id}"
+    if session_id and os.path.exists(flag_file):
+        sys.exit(0)
+    hit = False
+    if transcript_path and os.path.exists(transcript_path):
+        try:
+            lines = open(transcript_path, encoding="utf-8", errors="replace").readlines()
+            for raw_line in lines[-50:]:
+                try:
+                    entry = json.loads(raw_line.strip())
+                    msg = entry.get("message", {})
+                    if not isinstance(msg, dict): continue
+                    if msg.get("model") != "<synthetic>": continue
+                    content = msg.get("content", "")
+                    txt = (content if isinstance(content, str) else "").lower()
+                    if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
+                        hit = True
+                        break
+                except: continue
+        except: pass
+    if not hit:
+        sys.exit(0)
+    if session_id:
+        try: open(flag_file, 'w').close()
+        except: pass
+    ca = ""
+    try:
+        r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            ca = json.loads(r.stdout).get("email", "")
+    except: pass
+    mf = "opus" if "opus" in model else "sonnet" if "sonnet" in model else "haiku" if "haiku" in model else "opus"
+    d = {
+        "event": "usage_limit_hit",
+        "detail": "usage limit detected",
+        "user": user_email or getpass.getuser(),
+        "session_id": session_id or None,
+        "claude_account": ca or None,
+        "model": model or "claude-opus-4-6",
+        "model_family": mf,
+        "session_tokens": session_tokens,
+        "cwd": hook.get("cwd", os.getcwd()) or None,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    d = {k: v for k, v in d.items() if v is not None}
+    try:
+        req = urllib.request.Request(
+            f"{api_url}/api/entities/tracking/records",
+            data=json.dumps(d).encode(),
+            headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except: pass
+    sys.exit(0)
+
 if event_type == "session_update":
     last_msg = hook.get("last_assistant_message", "") or ""
     # Debug: always log last_assistant_message so we can diagnose missed detections
@@ -247,33 +306,33 @@ if event_type == "session_update":
 
     hit = isinstance(last_msg, str) and any(kw in last_msg.lower() for kw in USAGE_LIMIT_KEYWORDS)
 
-    # Fallback: scan transcript for usage limit messages if last_assistant_message didn't match
+    # Fallback: scan last 50 transcript entries for <synthetic> limit messages only.
+    # Using model="<synthetic>" filter avoids false positives from assistant text.
+    # Also skip if UserPromptSubmit already detected and flagged this session.
     if not hit and transcript_path and os.path.exists(transcript_path):
-        try:
-            with open(transcript_path, encoding="utf-8", errors="replace") as tf:
-                for raw_line in tf:
+        flag_file = f"/tmp/fyso-limit-hit-{session_id}"
+        if not (session_id and os.path.exists(flag_file)):
+            try:
+                lines = open(transcript_path, encoding="utf-8", errors="replace").readlines()
+                for raw_line in lines[-50:]:
                     try:
                         entry = json.loads(raw_line.strip())
                         msg = entry.get("message", {})
-                        if not isinstance(msg, dict):
-                            continue
-                        content = msg.get("content", [])
-                        if isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    txt = (c.get("text", "") or "").lower()
-                                    if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
-                                        hit = True
-                                        break
-                        if hit:
+                        if not isinstance(msg, dict): continue
+                        if msg.get("model") != "<synthetic>": continue
+                        content = msg.get("content", "")
+                        txt = (content if isinstance(content, str) else "").lower()
+                        if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
+                            hit = True
                             break
-                    except:
-                        continue
-        except:
-            pass
+                    except: continue
+            except: pass
 
     if hit:
         event_type = "usage_limit_hit"
+        if session_id:
+            try: open(f"/tmp/fyso-limit-hit-{session_id}", 'w').close()
+            except: pass
 
 # 2. Rate limit / overloaded: tool_response contains an error object (PostToolUse)
 if event_type == "agent_dispatch":
