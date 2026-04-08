@@ -3,7 +3,7 @@
 Called from tracking.sh session_start via background subprocess.
 Expects P dict with: transcript_dir, session_id, api_url, token, tenant, user_email, cwd
 """
-import json, os, sys, datetime, getpass, subprocess, glob
+import json, os, sys, datetime, getpass, subprocess, glob, time
 
 try:
     import urllib.request
@@ -17,6 +17,7 @@ if _dbg:
     open(_dbg_log, "a").write("SESSION_START_BG: checking previous sessions\n")
 
 KEYWORDS = ("usage limit", "out of extra usage", "you're out of", "out of claude", "plan limit", "quota exceeded")
+MAX_TRANSCRIPT_AGE_SECS = 6 * 3600
 
 transcript_dir = P["transcript_dir"]
 session_id = P["session_id"]
@@ -31,6 +32,14 @@ if not transcript_dir:
 
 transcripts = sorted(glob.glob(os.path.join(transcript_dir, "*.jsonl")), key=os.path.getmtime, reverse=True)
 
+# Clean up flag files older than 24h
+for old_flag in glob.glob("/tmp/fyso-limit-hit-*"):
+    try:
+        if time.time() - os.path.getmtime(old_flag) > 86400:
+            os.unlink(old_flag)
+    except OSError:
+        pass
+
 if _dbg:
     open(_dbg_log, "a").write(f"SESSION_START_BG: found {len(transcripts)} transcripts, checking top 5\n")
 
@@ -38,10 +47,17 @@ for tf in transcripts[:5]:
     tf_session = os.path.basename(tf).replace(".jsonl", "")
     if tf_session == session_id:
         continue
+    if time.time() - os.path.getmtime(tf) > MAX_TRANSCRIPT_AGE_SECS:
+        continue
     flag_file = f"/tmp/fyso-limit-hit-{tf_session}"
-    if os.path.exists(flag_file):
+    try:
+        fd = os.open(flag_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
         if _dbg:
             open(_dbg_log, "a").write(f"SESSION_START_BG: {tf_session[:8]} already flagged, skip\n")
+        continue
+    except OSError:
         continue
     # Read only the tail of the file (last 20KB)
     try:
@@ -75,10 +91,6 @@ for tf in transcripts[:5]:
             if any(kw in txt for kw in KEYWORDS):
                 if _dbg:
                     open(_dbg_log, "a").write(f"SESSION_START_BG: MATCH in {tf_session[:8]} txt={repr(txt[:80])}\n")
-                try:
-                    open(flag_file, "w").close()
-                except:
-                    pass
                 ca = ""
                 try:
                     r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=3)
