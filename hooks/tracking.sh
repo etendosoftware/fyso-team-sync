@@ -285,6 +285,18 @@ if event_type == "stop_failure":
         if _dbg:
             open(_dbg_log, "a").write(f"STOP_FAILURE: flag exists, skipping\n")
         sys.exit(0)
+    # Cross-session dedup: skip if a limit was already reported within the last 5 hours
+    _global_flag = os.path.expanduser("~/.fyso/last-limit-hit")
+    _dedup_hours = 5
+    if os.path.exists(_global_flag):
+        try:
+            _age_h = (datetime.datetime.now().timestamp() - os.path.getmtime(_global_flag)) / 3600
+            if _age_h < _dedup_hours:
+                if _dbg:
+                    open(_dbg_log, "a").write(f"STOP_FAILURE: global flag age={_age_h:.1f}h < {_dedup_hours}h, skipping\n")
+                sys.exit(0)
+        except:
+            pass
     # Create flag file to prevent duplicate detection (also blocks usage_limit_check fallback)
     if session_id:
         try: open(flag_file, 'w').close()
@@ -336,6 +348,9 @@ if event_type == "stop_failure":
             headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant, "Content-Type": "application/json"},
             method="POST",
         )
+        # Update global cross-session flag
+        try: open(_global_flag, 'w').close()
+        except: pass
         resp = urllib.request.urlopen(req, timeout=5)
         if _dbg:
             open(_dbg_log, "a").write(f"STOP_FAILURE: sent OK {resp.status}\n")
@@ -356,6 +371,18 @@ if event_type == "usage_limit_check":
         if _dbg:
             open(_dbg_log, "a").write(f"LIMIT_CHECK: flag exists, skipping\n")
         sys.exit(0)
+    # Cross-session dedup: skip if a limit was already reported within the last 5 hours
+    _global_flag = os.path.expanduser("~/.fyso/last-limit-hit")
+    _dedup_hours = 5
+    if os.path.exists(_global_flag):
+        try:
+            _age_h = (datetime.datetime.now().timestamp() - os.path.getmtime(_global_flag)) / 3600
+            if _age_h < _dedup_hours:
+                if _dbg:
+                    open(_dbg_log, "a").write(f"LIMIT_CHECK: global flag age={_age_h:.1f}h < {_dedup_hours}h, skipping\n")
+                sys.exit(0)
+        except:
+            pass
     hit = False
     _reset_at2 = None
     if transcript_path and os.path.exists(transcript_path):
@@ -433,6 +460,9 @@ if event_type == "usage_limit_check":
             headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": tenant, "Content-Type": "application/json"},
             method="POST",
         )
+        # Update global cross-session flag
+        try: open(_global_flag, 'w').close()
+        except: pass
         resp = urllib.request.urlopen(req, timeout=5)
         if _dbg:
             open(_dbg_log, "a").write(f"LIMIT_CHECK: sent OK {resp.status}\n")
