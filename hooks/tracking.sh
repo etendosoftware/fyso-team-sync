@@ -296,6 +296,10 @@ if event_type == "stop_failure":
         if r.returncode == 0:
             ca = json.loads(r.stdout).get("email", "")
     except: pass
+    # Extract reset time from last_assistant_message
+    _lam = hook.get("last_assistant_message", "")
+    _reset_m = re.search(r'resets\s+(\d+(?::\d+)?(?:am|pm))\s+\(([^)]+)\)', _lam, re.IGNORECASE)
+    _reset_at = f"{_reset_m.group(1)} ({_reset_m.group(2)})" if _reset_m else None
     # Normalize model
     if not model or model == "<synthetic>":
         model = "claude-opus-4-6"
@@ -303,6 +307,7 @@ if event_type == "stop_failure":
     d = {
         "event": "usage_limit_hit",
         "detail": f"stop_failure: {error_type}" + (f" - {str(error_message)[:100]}" if error_message else ""),
+        "limit_reset_at": _reset_at or None,
         "user": user_email or getpass.getuser(),
         "session_id": session_id or None,
         "claude_account": ca or None,
@@ -352,6 +357,7 @@ if event_type == "usage_limit_check":
             open(_dbg_log, "a").write(f"LIMIT_CHECK: flag exists, skipping\n")
         sys.exit(0)
     hit = False
+    _reset_at2 = None
     if transcript_path and os.path.exists(transcript_path):
         try:
             lines = open(transcript_path, encoding="utf-8", errors="replace").readlines()
@@ -365,13 +371,16 @@ if event_type == "usage_limit_check":
                     if msg.get("model") != "<synthetic>": continue
                     content = msg.get("content", "")
                     if isinstance(content, list):
-                        txt = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text").lower()
+                        txt_orig = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
                     else:
-                        txt = (content if isinstance(content, str) else "").lower()
+                        txt_orig = (content if isinstance(content, str) else "")
+                    txt = txt_orig.lower()
                     if _dbg:
                         open(_dbg_log, "a").write(f"LIMIT_CHECK: synthetic found txt={repr(txt[:100])}\n")
                     if any(kw in txt for kw in USAGE_LIMIT_KEYWORDS):
                         hit = True
+                        _reset_m2 = re.search(r'resets\s+(\d+(?::\d+)?(?:am|pm))\s+\(([^)]+)\)', txt_orig, re.IGNORECASE)
+                        _reset_at2 = f"{_reset_m2.group(1)} ({_reset_m2.group(2)})" if _reset_m2 else None
                         break
                 except: continue
         except: pass
@@ -395,6 +404,7 @@ if event_type == "usage_limit_check":
     d = {
         "event": "usage_limit_hit",
         "detail": "usage limit detected",
+        "limit_reset_at": _reset_at2 or None,
         "user": user_email or getpass.getuser(),
         "session_id": session_id or None,
         "claude_account": ca or None,
