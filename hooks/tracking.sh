@@ -1,7 +1,8 @@
 #!/bin/bash
-# Fyso Team Sync — Usage tracking hook v2.0
+# Fyso Team Sync — Usage tracking hook v3.0
 # Reads hook data from stdin (JSON) and sends to Fyso API
 # Supports: session_start, session_end, agent_dispatch, subagent_start, subagent_stop, stop_failure
+# v3.0: dual-writes to tracking_daily for real-time per-day aggregates
 
 CONFIG="$HOME/.fyso/config.json"
 [ ! -f "$CONFIG" ] && exit 0
@@ -43,6 +44,215 @@ user_email = cfg.get("user_email", "")
 
 if not token or not tenant:
     sys.exit(0)
+
+# ── Corporate account detection (matches tracking-aggregator.ts) ──────────────
+CORPORATE_DOMAINS = ("@smfconsulting.es", "@etendo.software")
+
+def is_corporate(acct):
+    if not acct: return False
+    return any(acct.endswith(d) for d in CORPORATE_DOMAINS)
+
+# ── tracking_daily dual-write helper ──────────────────────────────────────────
+# Maintains per-day per-user aggregates in real-time so the dashboard can read
+# from a pre-aggregated table instead of scanning raw events. Delta logic
+# attributes tokens/cost to the claude_account of the current event.
+# Fire-and-forget: failures here never block the main tracking POST.
+def upsert_tracking_daily(api_url, token, tenant, debug_path,
+                          date_str, user_email, event_type, claude_account,
+                          model, input_tokens, output_tokens,
+                          cache_creation_tokens, cache_read_tokens,
+                          cost_usd, is_dispatch, agent_name):
+    import urllib.request, urllib.parse
+    def _dbg(msg):
+        if debug_path and os.path.exists(debug_path):
+            try:
+                with open(os.path.expanduser("~/.fyso/hook-debug.log"), "a") as _l:
+                    _l.write(f"DAILY: {msg}\n")
+            except: pass
+
+    is_usage_limit = event_type == "usage_limit_hit"
+    is_rate_limit = event_type in ("rate_limit_hit", "overloaded_hit")
+    corp = is_corporate(claude_account)
+
+    delta_cost = float(cost_usd or 0)
+    delta_in = int(input_tokens or 0)
+    delta_out = int(output_tokens or 0)
+    delta_cc = int(cache_creation_tokens or 0)
+    delta_cr = int(cache_read_tokens or 0)
+    delta_total = delta_in + delta_out + delta_cc + delta_cr
+
+    session_inc = 1 if event_type == "session_start" else 0
+    personal_session_inc = session_inc if (claude_account and not corp) else 0
+    dispatch_inc = 1 if is_dispatch else 0
+    usage_limit_inc = 1 if is_usage_limit else 0
+    rate_limit_inc = 1 if is_rate_limit else 0
+
+    headers_ = {
+        "Authorization": f"Bearer {token}",
+        "X-Tenant-ID": tenant,
+        "Content-Type": "application/json",
+    }
+    params = urllib.parse.urlencode({
+        "limit": 1,
+        "filter.date": date_str,
+        "filter.user": user_email,
+    })
+
+    # GET existing record for (date, user)
+    try:
+        get_req = urllib.request.Request(
+            f"{api_url}/api/entities/tracking_daily/records?{params}",
+            headers=headers_,
+        )
+        get_resp = urllib.request.urlopen(get_req, timeout=4)
+        get_data = json.loads(get_resp.read().decode())
+        items = get_data.get("data", {}).get("items", [])
+    except Exception as e:
+        _dbg(f"GET failed: {e}")
+        return
+
+    existing = items[0] if items else None
+
+    if existing:
+        # Merge with existing row
+        models_set = set(m.strip() for m in (existing.get("models", "") or "").split(",") if m.strip())
+        if model: models_set.add(model)
+
+        # Merge accounts_data
+        try:
+            accts = json.loads(existing.get("accounts_data") or "[]")
+        except: accts = []
+        if claude_account:
+            entry = next((e for e in accts if e.get("account") == claude_account), None)
+            if not entry:
+                entry = {
+                    "account": claude_account,
+                    "isPersonal": not corp,
+                    "sessions": 0,
+                    "inputTokens": 0, "outputTokens": 0,
+                    "cacheCreateTokens": 0, "cacheReadTokens": 0,
+                    "costUsd": 0,
+                }
+                accts.append(entry)
+            entry["sessions"] = int(entry.get("sessions", 0) or 0) + session_inc
+            entry["inputTokens"] = int(entry.get("inputTokens", 0) or 0) + delta_in
+            entry["outputTokens"] = int(entry.get("outputTokens", 0) or 0) + delta_out
+            entry["cacheCreateTokens"] = int(entry.get("cacheCreateTokens", 0) or 0) + delta_cc
+            entry["cacheReadTokens"] = int(entry.get("cacheReadTokens", 0) or 0) + delta_cr
+            entry["costUsd"] = float(entry.get("costUsd", 0) or 0) + delta_cost
+
+        # Merge agents_data (only on dispatch)
+        try:
+            agts = json.loads(existing.get("agents_data") or "[]")
+        except: agts = []
+        if is_dispatch and agent_name:
+            entry = next((e for e in agts if e.get("agent") == agent_name), None)
+            if not entry:
+                entry = {
+                    "agent": agent_name,
+                    "dispatches": 0, "tokens": 0, "costUsd": 0,
+                    "users": [],
+                }
+                agts.append(entry)
+            entry["dispatches"] = int(entry.get("dispatches", 0) or 0) + 1
+            entry["tokens"] = int(entry.get("tokens", 0) or 0) + delta_total
+            entry["costUsd"] = float(entry.get("costUsd", 0) or 0) + delta_cost
+            users_list = entry.get("users") or []
+            if user_email not in users_list:
+                users_list.append(user_email)
+            entry["users"] = users_list
+
+        new_personal_sessions = int(existing.get("personal_sessions", 0) or 0) + personal_session_inc
+        new_data = {
+            "session_count": int(existing.get("session_count", 0) or 0) + session_inc,
+            "cost_usd": round(float(existing.get("cost_usd", 0) or 0) + delta_cost, 6),
+            "input_tokens": int(existing.get("input_tokens", 0) or 0) + delta_in,
+            "output_tokens": int(existing.get("output_tokens", 0) or 0) + delta_out,
+            "cache_creation_tokens": int(existing.get("cache_creation_tokens", 0) or 0) + delta_cc,
+            "cache_read_tokens": int(existing.get("cache_read_tokens", 0) or 0) + delta_cr,
+            "total_tokens": int(existing.get("total_tokens", 0) or 0) + delta_total,
+            "corporate_cost_usd": round(float(existing.get("corporate_cost_usd", 0) or 0) + (delta_cost if corp else 0), 6),
+            "personal_cost_usd": round(float(existing.get("personal_cost_usd", 0) or 0) + (delta_cost if not corp else 0), 6),
+            "dispatches": int(existing.get("dispatches", 0) or 0) + dispatch_inc,
+            "usage_limit_hits": int(existing.get("usage_limit_hits", 0) or 0) + usage_limit_inc,
+            "rate_limit_hits": int(existing.get("rate_limit_hits", 0) or 0) + rate_limit_inc,
+            "personal_sessions": new_personal_sessions,
+            "used_personal_account": bool(existing.get("used_personal_account")) or new_personal_sessions > 0,
+            "models": ",".join(sorted(models_set)),
+            "accounts_data": json.dumps(accts) if accts else "",
+            "agents_data": json.dumps(agts) if agts else "",
+        }
+
+        try:
+            put_req = urllib.request.Request(
+                f"{api_url}/api/entities/tracking_daily/records/{existing['id']}",
+                data=json.dumps(new_data).encode(),
+                headers=headers_,
+                method="PUT",
+            )
+            urllib.request.urlopen(put_req, timeout=4)
+            _dbg(f"PUT ok: {date_str}/{user_email}")
+        except Exception as e:
+            _dbg(f"PUT failed: {e}")
+    else:
+        # Create new row
+        accts_init = []
+        if claude_account:
+            accts_init = [{
+                "account": claude_account,
+                "isPersonal": not corp,
+                "sessions": session_inc,
+                "inputTokens": delta_in, "outputTokens": delta_out,
+                "cacheCreateTokens": delta_cc, "cacheReadTokens": delta_cr,
+                "costUsd": delta_cost,
+            }]
+        agts_init = []
+        if is_dispatch and agent_name:
+            agts_init = [{
+                "agent": agent_name,
+                "dispatches": 1,
+                "tokens": delta_total,
+                "costUsd": delta_cost,
+                "users": [user_email],
+            }]
+
+        new_data = {
+            "name": f"{date_str}_{user_email}",
+            "date": date_str,
+            "user": user_email,
+            "session_count": session_inc,
+            "cost_usd": round(delta_cost, 6),
+            "input_tokens": delta_in,
+            "output_tokens": delta_out,
+            "cache_creation_tokens": delta_cc,
+            "cache_read_tokens": delta_cr,
+            "total_tokens": delta_total,
+            "corporate_cost_usd": round(delta_cost if corp else 0, 6),
+            "personal_cost_usd": round(delta_cost if not corp else 0, 6),
+            "dispatches": dispatch_inc,
+            "usage_limit_hits": usage_limit_inc,
+            "rate_limit_hits": rate_limit_inc,
+            "personal_sessions": personal_session_inc,
+            "used_personal_account": personal_session_inc > 0,
+            "models": model or "",
+            "accounts_data": json.dumps(accts_init) if accts_init else "",
+            "agents_data": json.dumps(agts_init) if agts_init else "",
+        }
+
+        try:
+            post_req = urllib.request.Request(
+                f"{api_url}/api/entities/tracking_daily/records",
+                data=json.dumps(new_data).encode(),
+                headers=headers_,
+                method="POST",
+            )
+            urllib.request.urlopen(post_req, timeout=4)
+            _dbg(f"POST ok: {date_str}/{user_email}")
+        except Exception as e:
+            _dbg(f"POST failed: {e}")
+
+# Events that don't contribute to tracking_daily (summaries, heartbeats)
+TRACKING_DAILY_SKIP_EVENTS = {"heartbeat", "session_end", "session_update"}
 
 # Read stdin JSON from temp file (once)
 tmpfile = os.environ.get("TMPFILE", "")
@@ -584,6 +794,7 @@ if os.path.exists(debug_path):
         dl.write(f"PAYLOAD: {payload.decode()}\n")
 
 # Send
+_main_resp_body = None
 try:
     req = urllib.request.Request(
         f"{api_url}/api/entities/tracking/records",
@@ -596,15 +807,39 @@ try:
         method="POST",
     )
     resp = urllib.request.urlopen(req, timeout=5)
-    resp_body = resp.read().decode()
+    _main_resp_body = resp.read().decode()
     if os.path.exists(debug_path):
         with open(log_path, "a") as dl:
-            dl.write(f"RESPONSE: {resp.status} {resp_body[:200]}\n\n")
+            dl.write(f"RESPONSE: {resp.status} {_main_resp_body[:200]}\n\n")
 except Exception as e:
     if os.path.exists(debug_path):
         log_path = os.path.expanduser("~/.fyso/hook-debug.log")
         with open(log_path, "a") as dl:
             dl.write(f"ERROR: {e}\n\n")
+
+# Dual-write to tracking_daily (fire-and-forget; failures don't block).
+# The server computes cost_usd via a business rule on tracking insert, so we
+# read it back from the response and use the same value in tracking_daily.
+if _main_resp_body and user and event_type not in TRACKING_DAILY_SKIP_EVENTS:
+    try:
+        _resp_json = json.loads(_main_resp_body)
+        _resp_cost = 0
+        if isinstance(_resp_json, dict):
+            _d = _resp_json.get("data") or {}
+            if isinstance(_d, dict):
+                _resp_cost = _d.get("cost_usd") or 0
+        _date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        upsert_tracking_daily(
+            api_url, token, tenant, debug_path,
+            _date_str, user, event_type, claude_account,
+            model, input_tokens, output_tokens,
+            cache_creation_tokens, cache_read_tokens,
+            _resp_cost, event_type == "agent_dispatch", agent,
+        )
+    except Exception as _e:
+        if os.path.exists(debug_path):
+            with open(log_path, "a") as dl:
+                dl.write(f"DAILY_ERROR: {_e}\n")
 PYEOF
 
 # Cleanup
