@@ -510,12 +510,19 @@ if event_type == "stop_failure":
     _dbg_log = os.path.expanduser("~/.fyso/hook-debug.log")
     if _dbg:
         open(_dbg_log, "a").write(f"STOP_FAILURE: error_type={repr(error_type)} error_message={repr(str(error_message)[:200])}\n")
-    # Deduplicate: skip if already detected for this session
+    # Deduplicate: skip if already detected for this session within the last 5 hours
     flag_file = f"/tmp/fyso-limit-hit-{session_id}"
     if session_id and os.path.exists(flag_file):
+        try:
+            _sess_age_h = (datetime.datetime.now().timestamp() - os.path.getmtime(flag_file)) / 3600
+        except:
+            _sess_age_h = 0
+        if _sess_age_h < 5:
+            if _dbg:
+                open(_dbg_log, "a").write(f"STOP_FAILURE: flag exists age={_sess_age_h:.1f}h < 5h, skipping\n")
+            sys.exit(0)
         if _dbg:
-            open(_dbg_log, "a").write(f"STOP_FAILURE: flag exists, skipping\n")
-        sys.exit(0)
+            open(_dbg_log, "a").write(f"STOP_FAILURE: flag expired age={_sess_age_h:.1f}h, re-reporting\n")
     # Cross-session dedup: skip if a limit was already reported within the last 5 hours
     _global_flag = os.path.expanduser("~/.fyso/last-limit-hit")
     _dedup_hours = 5
@@ -599,9 +606,16 @@ if event_type == "usage_limit_check":
     _dbg = os.path.exists(os.path.expanduser("~/.fyso/debug"))
     _dbg_log = os.path.expanduser("~/.fyso/hook-debug.log")
     if session_id and os.path.exists(flag_file):
+        try:
+            _sess_age_h = (datetime.datetime.now().timestamp() - os.path.getmtime(flag_file)) / 3600
+        except:
+            _sess_age_h = 0
+        if _sess_age_h < 5:
+            if _dbg:
+                open(_dbg_log, "a").write(f"LIMIT_CHECK: flag exists age={_sess_age_h:.1f}h < 5h, skipping\n")
+            sys.exit(0)
         if _dbg:
-            open(_dbg_log, "a").write(f"LIMIT_CHECK: flag exists, skipping\n")
-        sys.exit(0)
+            open(_dbg_log, "a").write(f"LIMIT_CHECK: flag expired age={_sess_age_h:.1f}h, re-reporting\n")
     # Cross-session dedup: skip if a limit was already reported within the last 5 hours
     _global_flag = os.path.expanduser("~/.fyso/last-limit-hit")
     _dedup_hours = 5
