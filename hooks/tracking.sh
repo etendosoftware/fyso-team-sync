@@ -24,7 +24,7 @@ fi
 # Single python call: read config + parse stdin + build payload + send
 export TMPFILE EVENT_TYPE
 python3 << 'PYEOF'
-import json, re, datetime, os, sys, getpass, hashlib, subprocess
+import json, re, datetime, os, sys, getpass, hashlib, subprocess, fcntl
 try:
     import urllib.request
 except:
@@ -260,9 +260,12 @@ _SESSION_STATE_PATH = os.path.expanduser("~/.fyso/session-state.json")
 
 def _load_sess_state():
     try:
-        if os.path.exists(_SESSION_STATE_PATH):
-            with open(_SESSION_STATE_PATH) as _sf:
-                return json.load(_sf)
+        os.makedirs(os.path.dirname(_SESSION_STATE_PATH), exist_ok=True)
+        with open(_SESSION_STATE_PATH, 'a+') as _sf:
+            fcntl.flock(_sf, fcntl.LOCK_EX)
+            _sf.seek(0)
+            content = _sf.read().strip()
+            return json.loads(content) if content else {}
     except Exception:
         pass
     return {}
@@ -270,8 +273,11 @@ def _load_sess_state():
 def _save_sess_state(_st):
     try:
         os.makedirs(os.path.dirname(_SESSION_STATE_PATH), exist_ok=True)
-        with open(_SESSION_STATE_PATH, 'w') as _sf:
+        with open(_SESSION_STATE_PATH, 'r+') as _sf:
+            fcntl.flock(_sf, fcntl.LOCK_EX)
+            _sf.seek(0)
             json.dump(_st, _sf)
+            _sf.truncate()
     except Exception:
         pass
 
@@ -864,80 +870,19 @@ except Exception as e:
         with open(log_path, "a") as dl:
             dl.write(f"ERROR: {e}\n\n")
 
-# Dual-write to tracking_daily (fire-and-forget; failures don't block).
-# session_update: uses per-session delta state to avoid double-counting.
-# All other events: use per-event cost_usd from the server response.
-if _main_resp_body and user and event_type not in TRACKING_DAILY_SKIP_EVENTS:
-    try:
-        _resp_json = json.loads(_main_resp_body)
-        _resp_cost = 0
-        _resp_session_cost = 0.0
-        if isinstance(_resp_json, dict):
-            _d = _resp_json.get("data") or {}
-            if isinstance(_d, dict):
-                _resp_cost = _d.get("cost_usd") or 0
-                _resp_session_cost = float(_d.get("session_cost_usd") or 0)
-        _date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
-        if event_type == "session_start" and session_id:
-            # Initialise baseline so the first session_update can compute deltas.
-            _st = _load_sess_state()
-            if session_id not in _st:
-                _st[session_id] = {
-                    "input": 0, "output": 0, "cc": 0, "cr": 0,
-                    "session_cost_usd": 0.0, "date": _date_str,
-                }
-                _save_sess_state(_st)
-            upsert_tracking_daily(
-                api_url, token, tenant, debug_path,
-                _date_str, user, event_type, claude_account,
-                model, 0, 0, 0, 0, 0, False, None,
-            )
-        elif event_type == "session_update" and session_id:
-            _st = _load_sess_state()
-            _prev = _st.get(session_id)
-            _cur_in = int(session_input or 0)
-            _cur_out = int(session_output or 0)
-            _cur_cc = int(session_cache_creation or 0)
-            _cur_cr = int(session_cache_read or 0)
-            _cur_cost = _resp_session_cost
-
-            if _prev is not None:
-                _d_in  = max(0, _cur_in  - int(_prev.get("input", 0)  or 0))
-                _d_out = max(0, _cur_out - int(_prev.get("output", 0) or 0))
-                _d_cc  = max(0, _cur_cc  - int(_prev.get("cc", 0)     or 0))
-                _d_cr  = max(0, _cur_cr  - int(_prev.get("cr", 0)     or 0))
-                _d_cost = max(0.0, _cur_cost - float(_prev.get("session_cost_usd", 0) or 0))
-                if _d_in or _d_out or _d_cc or _d_cr or _d_cost:
-                    upsert_tracking_daily(
-                        api_url, token, tenant, debug_path,
-                        _date_str, user, "session_update", claude_account,
-                        model, _d_in, _d_out, _d_cc, _d_cr,
-                        _d_cost, False, None,
-                    )
-
-            # Save new state; prune sessions older than 2 days.
-            _st[session_id] = {
-                "input": _cur_in, "output": _cur_out,
-                "cc": _cur_cc, "cr": _cur_cr,
-                "session_cost_usd": _cur_cost, "date": _date_str,
-            }
-            _cutoff = (datetime.datetime.now() - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
-            _st = {k: v for k, v in _st.items()
-                   if isinstance(v, dict) and v.get("date", "") >= _cutoff}
-            _save_sess_state(_st)
-        else:
-            upsert_tracking_daily(
-                api_url, token, tenant, debug_path,
-                _date_str, user, event_type, claude_account,
-                model, input_tokens, output_tokens,
-                cache_creation_tokens, cache_read_tokens,
-                _resp_cost, event_type == "agent_dispatch", agent,
-            )
-    except Exception as _e:
-        if os.path.exists(debug_path):
-            with open(log_path, "a") as dl:
-                dl.write(f"DAILY_ERROR: {_e}\n")
+# Dual-write to tracking_daily is DISABLED (2026-04-13).
+#
+# Reason: the Fyso business rule on tracking_daily accumulates values on PUT
+# (designed for delta-only writes). The plugin was sending full accumulated
+# totals, causing each PUT to roughly double the delta — resulting in inflated
+# numbers visible in the dashboard.
+#
+# tracking_daily is now rebuilt exclusively from raw tracking events via:
+#   - Auto-refresh on page load (refreshTodayFast) — corrects today
+#   - "Actualizar" button (refreshTrackingDaily) — corrects last N days
+#
+# The plugin's only responsibility is writing raw events to the tracking table,
+# which it does correctly and completely.
 PYEOF
 
 # Cleanup
