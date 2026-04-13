@@ -592,6 +592,12 @@ if event_type == "stop_failure":
         resp = urllib.request.urlopen(req, timeout=5)
         if _dbg:
             open(_dbg_log, "a").write(f"STOP_FAILURE: sent OK {resp.status}\n")
+        _date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        upsert_tracking_daily(
+            api_url, token, tenant, _dbg_log,
+            _date_str, user_email or getpass.getuser(), "usage_limit_hit", ca,
+            model, 0, 0, 0, 0, 0, False, None,
+        )
     except Exception as e:
         if _dbg:
             open(_dbg_log, "a").write(f"STOP_FAILURE: send error {e}\n")
@@ -711,6 +717,12 @@ if event_type == "usage_limit_check":
         resp = urllib.request.urlopen(req, timeout=5)
         if _dbg:
             open(_dbg_log, "a").write(f"LIMIT_CHECK: sent OK {resp.status}\n")
+        _date_str2 = datetime.datetime.now().strftime("%Y-%m-%d")
+        upsert_tracking_daily(
+            api_url, token, tenant, _dbg_log,
+            _date_str2, user_email or getpass.getuser(), "usage_limit_hit", ca,
+            model, 0, 0, 0, 0, 0, False, None,
+        )
     except Exception as e:
         if _dbg:
             open(_dbg_log, "a").write(f"LIMIT_CHECK: send error {e}\n")
