@@ -391,7 +391,7 @@ async function handleTrackingEvent() {
     else if (errType === 'overloaded_error') actualEvent = 'overloaded_hit';
   }
 
-  // ── Model for subagent-dispatch events: never the orchestrator's ─────────
+  // ── Model (and, for subagent_stop, tokens) for subagent-dispatch events ──
   // `model` above (from scanTranscript(transcriptPath)) is the ORCHESTRATOR
   // session's model. That's correct for session_start/session_update/
   // usage_limit_hit, but a subagent can run on a different model than
@@ -406,13 +406,21 @@ async function handleTrackingEvent() {
   // server already treats an unknown model as "cost not computed" rather
   // than inventing a price, and an absent cost is honest where a wrong one
   // contaminates totals.
+  //
+  // `eventTokens`, set only for subagent_stop below, overrides the session-
+  // delta tokens computed later in sendUsageEvent with the subagent's own
+  // transcript totals — see the comment there for why the delta is wrong
+  // once subagents can overlap, and why sendUsageEvent must NOT advance the
+  // session token marker when this is set.
+  let eventTokens;
   if (EVENT_TYPE === 'agent_dispatch') {
     // Fired synchronously right after the Task tool call returns (PostToolUse,
     // matcher "Agent") — before the subagent has necessarily produced any
     // transcript of its own, so there's nothing on disk to read yet. Claude
     // Code already resolved the model for us: it's in this same event's
     // tool_response (verified against a real payload), so no extra file read
-    // is needed at all.
+    // is needed at all. Tokens for this event stay the session delta
+    // (unchanged) — there's no subagent transcript to sum from yet.
     model = toolResponse.resolvedModel || undefined;
   } else if (EVENT_TYPE === 'subagent_start') {
     // SubagentStop carries agent_transcript_path; SubagentStart does not
@@ -421,10 +429,23 @@ async function handleTrackingEvent() {
     // is no trustworthy source for the subagent's model yet at this point in
     // its lifecycle. Sending the session's model here would be the exact bug
     // this fix removes, just moved earlier — so it's left unset instead;
-    // subagent_stop reports the real one once the transcript exists.
+    // subagent_stop reports the real one once the transcript exists. Tokens
+    // stay the session delta, same reasoning as agent_dispatch above.
     model = undefined;
   } else if (EVENT_TYPE === 'subagent_stop') {
-    model = resolveSubagentModel(agentTranscriptPath) || undefined;
+    // The subagent is done, so its own transcript is complete — read it in
+    // full (needed for a correct deduplicated token sum, not just the model,
+    // so the earlier tail-only read no longer saves a second pass) and reuse
+    // scanTranscript's own request-id dedup so a retried call inside the
+    // subagent isn't double-counted, same as the orchestrator-level totals.
+    const subagentScan = scanTranscript(agentTranscriptPath, { collectDetail: false });
+    model = subagentScan.model || undefined;
+    // totals.total > 0 doubles as "we actually found usage data" — an
+    // absent/unreadable/empty subagent transcript leaves eventTokens unset,
+    // which falls back to the session-delta behavior in sendUsageEvent
+    // (report the delta, advance the marker) exactly as before this feature,
+    // rather than reporting a false zero for a subagent that really ran.
+    if (subagentScan.totals.total > 0) eventTokens = subagentScan.totals;
   } else if (!model) {
     model = 'claude-opus-4-6';
   }
@@ -452,6 +473,7 @@ async function handleTrackingEvent() {
     messageId: messageId || undefined,
     cwd: hookCwd,
     tokensNow: scan.totals,
+    eventTokens,
     forceAccountRefresh: actualEvent === 'usage_limit_hit',
     timestamp: new Date().toISOString(),
   });
@@ -637,6 +659,20 @@ async function sendUsageEvent(raw) {
       cacheRead: Math.max(0, now.cacheRead - last.cacheRead),
     };
 
+    // subagent_stop passes `eventTokens`: the subagent's own transcript
+    // totals (deduplicated by message id, same as scanTranscript), summed
+    // over its whole run instead of derived from session growth. Session
+    // growth is the wrong number for a per-agent breakdown once subagents
+    // can overlap — the window between subagent_start and subagent_stop
+    // also picks up whatever else grew the session in that time (sibling
+    // subagents running in parallel, the orchestrator's own tool calls), so
+    // a subagent's own event ends up billed for its neighbors' consumption
+    // too. `eventTokens` is only set when that subagent transcript actually
+    // yielded usage data (see handleTrackingEvent) — otherwise this falls
+    // back to the ordinary delta, exactly as before this feature existed.
+    const usingOwnTotals = !!raw.eventTokens;
+    const eventTokens = raw.eventTokens || delta;
+
     const payload = clean({
       event: raw.event,
       tool: raw.tool,
@@ -650,12 +686,14 @@ async function sendUsageEvent(raw) {
       message_id: raw.messageId,
       // Delta since the last successfully-reported marker for this session —
       // replaces the old "per-event tokens" (which were non-zero only for
-      // agent_dispatch and thus captured ~0.3% of real consumption).
-      tokens: delta.total,
-      input_tokens: delta.input,
-      output_tokens: delta.output,
-      cache_creation_tokens: delta.cacheCreation,
-      cache_read_tokens: delta.cacheRead,
+      // agent_dispatch and thus captured ~0.3% of real consumption) — unless
+      // `usingOwnTotals` is set, in which case these are the subagent's own
+      // transcript totals instead (see above).
+      tokens: eventTokens.total,
+      input_tokens: eventTokens.input,
+      output_tokens: eventTokens.output,
+      cache_creation_tokens: eventTokens.cacheCreation,
+      cache_read_tokens: eventTokens.cacheRead,
       // Accumulated session total — the control number the server falls
       // back to for machines that haven't updated their plugin yet.
       session_tokens: now.total,
@@ -690,10 +728,26 @@ async function sendUsageEvent(raw) {
     // subagent_stop later. The token marker, however, only advances on
     // success: a failed send means the next event's delta absorbs what this
     // one couldn't report, self-healing without a retry queue.
+    //
+    // When `usingOwnTotals` is set, the marker must NOT advance to `now`
+    // even on success: this event reported the subagent's own totals, not
+    // the session delta, so nothing has actually "consumed" the session
+    // growth that happened during this subagent's run. Leaving the marker
+    // where it was means the next marker-advancing event (any event type)
+    // computes its delta against the same old marker and so still carries
+    // that growth forward — it isn't lost from the session_* totals, which
+    // are the number the server's period totals are built from and stay
+    // correct either way. It also isn't a wash for the per-agent/model
+    // breakdown: whatever event picks up that carried-forward growth next
+    // will have it folded into ITS own tokens, generally misattributed to
+    // that unrelated event rather than left unattributed. That's a smaller,
+    // different problem than the one this fix removes (a specific
+    // subagent's own cost no longer gets inflated by its neighbors), but
+    // it's not nothing — flagging it rather than papering over it.
     if (sid) {
       state.sessions[sid] = state.sessions[sid] || {};
       state.sessions[sid].agents = agents;
-      if (ok) state.sessions[sid].tokens = now;
+      if (ok && !usingOwnTotals) state.sessions[sid].tokens = now;
       state.sessions[sid].updatedAt = new Date().toISOString();
     }
 
@@ -965,34 +1019,6 @@ function readTailLines(filePath, maxBytes) {
     text = nl >= 0 ? text.slice(nl + 1) : text;
   }
   return text.split('\n').filter(Boolean);
-}
-
-// Returns the last `message.model` seen in a subagent's own transcript, or
-// '' if it's missing, unreadable, or its tail holds no model at all (e.g. the
-// window landed entirely inside one huge tool_result with no assistant
-// message boundary). A subagent runs on one model for its whole transcript,
-// so unlike scanTranscript (which scans the full file for running token
-// totals) this only needs *a* model line, not all of them — reading just the
-// tail avoids parsing what can be multi-MB subagent transcripts inside the
-// hook's own ~5s foreground budget. Measured against real transcripts on
-// this machine: a 12.4MB file took ~100ms to read in full vs ~0.1ms for the
-// last 20KB.
-function resolveSubagentModel(agentTranscriptPath) {
-  if (!agentTranscriptPath) return '';
-  let lines;
-  try {
-    lines = readTailLines(agentTranscriptPath, TRANSCRIPT_TAIL_READ_BYTES);
-  } catch (e) { return ''; }
-
-  let model = '';
-  for (const line of lines) {
-    try {
-      const entry = JSON.parse(line);
-      const msg = entry.message;
-      if (msg && typeof msg === 'object' && msg.model) model = msg.model;
-    } catch (e) {}
-  }
-  return model;
 }
 
 function buildActivityDetail(scan) {
