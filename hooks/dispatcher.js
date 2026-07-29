@@ -291,9 +291,15 @@ async function handleTrackingEvent() {
   if (!messageId) messageId = hook.requestId || '';
 
   // ── stop_failure: immediate usage-limit detection via API error ──────────
+  // Both flag files below only gate re-detection — they are no longer
+  // written here. Writing them before dispatchSend meant a failed background
+  // POST (timeout, 401, fyso being flaky) still suppressed detection for 5h,
+  // losing the report for good even though nothing was ever confirmed sent.
+  // sendUsageEvent now writes them itself, and only after a 2xx — same
+  // "only advance on success" rule as the token-delta marker.
   if (EVENT_TYPE === 'stop_failure') {
     const flagFile = path.join(os.tmpdir(), `fyso-limit-hit-${sessionId}`);
-    const globalFlag = path.join(FYSO_DIR, 'last-limit-hit');
+    const globalFlag = path.join(FYSO_DIR, `last-limit-hit-${currentAccountKey()}`);
     if (sessionId && fs.existsSync(flagFile) && ageHours(flagFile) < 5) return;
     if (fs.existsSync(globalFlag) && ageHours(globalFlag) < 5) return;
 
@@ -305,9 +311,6 @@ async function handleTrackingEvent() {
     const resetAt = resetMatch ? `${resetMatch[1]} (${resetMatch[2]})` : undefined;
     const errorType = hook.error_type || '';
     const errorMsg = hook.error_message || hook.error || '';
-
-    try { fs.writeFileSync(flagFile, ''); } catch (e) {}
-    try { fs.writeFileSync(globalFlag, ''); } catch (e) {}
 
     dispatchSend({
       event: 'usage_limit_hit',
@@ -324,9 +327,10 @@ async function handleTrackingEvent() {
   }
 
   // ── usage_limit_check: fallback detection via <synthetic> transcript entries ──
+  // Same fix as stop_failure above: no write-before-dispatch here anymore.
   if (EVENT_TYPE === 'usage_limit_check') {
     const flagFile = path.join(os.tmpdir(), `fyso-limit-hit-${sessionId}`);
-    const globalFlag = path.join(FYSO_DIR, 'last-limit-hit');
+    const globalFlag = path.join(FYSO_DIR, `last-limit-hit-${currentAccountKey()}`);
     if (sessionId && fs.existsSync(flagFile) && ageHours(flagFile) < 5) return;
     if (fs.existsSync(globalFlag) && ageHours(globalFlag) < 5) return;
 
@@ -336,9 +340,6 @@ async function handleTrackingEvent() {
     const scan = scanTranscript(transcriptPath, { collectDetail: false });
     let model = scan.model;
     if (!model || model === '<synthetic>') model = 'claude-opus-4-6';
-
-    try { fs.writeFileSync(flagFile, ''); } catch (e) {}
-    try { fs.writeFileSync(globalFlag, ''); } catch (e) {}
 
     dispatchSend({
       event: 'usage_limit_hit',
@@ -366,14 +367,15 @@ async function handleTrackingEvent() {
   let actualEvent = EVENT_TYPE;
 
   // session_update: detect a usage limit from <synthetic> entries in the transcript.
+  // Same flag file as stop_failure/usage_limit_check above (and the same fix:
+  // sendUsageEvent is the one that writes it, only on success), so a failed
+  // dispatch here is retried on the next Stop instead of being suppressed
+  // for 5h with nothing actually reported.
   if (EVENT_TYPE === 'session_update') {
     const flagFile = path.join(os.tmpdir(), `fyso-limit-hit-${sessionId}`);
     if (!(sessionId && fs.existsSync(flagFile))) {
       const { hit } = detectUsageLimit(transcriptPath, USAGE_LIMIT_KEYWORDS);
-      if (hit) {
-        actualEvent = 'usage_limit_hit';
-        try { fs.writeFileSync(flagFile, ''); } catch (e) {}
-      }
+      if (hit) actualEvent = 'usage_limit_hit';
     }
   }
 
@@ -688,9 +690,61 @@ async function sendUsageEvent(raw) {
       }
     }
 
+    // usage_limit_hit dedup: the flag files that gate re-detection in
+    // stop_failure/usage_limit_check/session_update (both the per-session one
+    // in os.tmpdir() and the per-account one in FYSO_DIR) are written here,
+    // and only on success — mirrors the token-delta marker and everConnected
+    // above. Writing them at detection time (the old behavior) meant a
+    // failed POST — timeout, 401, fyso being flaky — still suppressed
+    // re-detection for 5h with nothing actually delivered; now a failure
+    // leaves both files untouched, so the very next Stop/prompt tries again.
+    if (ok && raw.event === 'usage_limit_hit') {
+      if (sid) {
+        try { fs.writeFileSync(path.join(os.tmpdir(), `fyso-limit-hit-${sid}`), ''); } catch (e) {}
+      }
+      try {
+        fs.writeFileSync(path.join(FYSO_DIR, `last-limit-hit-${accountFlagKey(claudeAccount)}`), '');
+      } catch (e) {}
+    }
+
     pruneOldSessions(state.sessions);
     writeJsonAtomic(SESSION_STATE_PATH, state);
   });
+}
+
+// ─── Per-account scoping for the usage-limit global flag ─────────────────────
+// The global `last-limit-hit` flag used to be one file per machine, so
+// hitting a limit on one Claude account and switching to another (exactly
+// what someone does to work around the limit) meant the second account's hit
+// wasn't recorded for up to 5h — silently erasing the evidence of *why* they
+// switched, which matters now that telemetry classifies usage in/out of plan
+// per account.
+//
+// `accountFlagKey` hashes the resolved email — the stable identity — never
+// `computeCredentialsFingerprint()`, which intentionally changes on every
+// OAuth token refresh (that's its whole purpose, cache invalidation) and
+// would turn "per account" into "per token refresh", re-triggering reports
+// for the *same* still-active limit far more often than intended.
+//
+// `currentAccountKey` (used only in the foreground gate, where resolving the
+// account for real means shelling out to `claude auth status` and risking the
+// hook's timeout) reads the last cached email instead — a cheap, sync, local
+// file read. That cache is refreshed by resolveClaudeAccount on the next
+// background send after any credentials change (fingerprint mismatch, not
+// just forceRefresh), so in practice it catches up within one event of an
+// account switch. The one edge case it can miss is a limit hit on the very
+// first prompt right after switching, before anything else has run in the
+// background to refresh the cache — accepted as a narrow, self-correcting
+// gap rather than adding a slow subprocess call to the foreground hot path.
+function accountFlagKey(email) {
+  const e = (email || '').trim().toLowerCase();
+  if (!e) return 'unknown';
+  return crypto.createHash('sha256').update(e).digest('hex').slice(0, 16);
+}
+
+function currentAccountKey() {
+  const cache = readJsonSafe(CLAUDE_ACCOUNT_CACHE_PATH, {});
+  return accountFlagKey(cache && cache.email);
 }
 
 // ─── Claude account (cached by a fingerprint of ~/.claude/.credentials.json) ──
