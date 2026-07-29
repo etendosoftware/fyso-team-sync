@@ -6,14 +6,24 @@ user-invocable: true
 
 # Sync Fyso Team Agents
 
-Follow these steps exactly to sync a Fyso team's agents into the local `.claude/agents/` directory and the team prompt into `.claude/CLAUDE.md`.
+Follow these steps exactly to sync a Fyso team's agents and skills into the
+local `.claude/agents/` and `.claude/skills/` directories. This skill runs
+inside Claude Code, and once connected, reads the team catalog through the
+`fyso` MCP server (tools `listar_equipos` / `obtener_equipo`) — never via
+`curl` against fyso directly, and never with a URL or token typed into a
+shell command.
 
 ## Config structure
 
 This plugin uses two config files:
 
-- `~/.fyso/config.json` — **global** (user credentials, shared across all projects)
-- `.fyso/team.json` — **local** (team info, per project directory)
+- `~/.fyso/config.json` — **global** (shared across all projects). Also read
+  by the hooks in `hooks/dispatcher.js` for telemetry and the team-version
+  check, so its shape is a shared contract: **exactly two keys**, `token`
+  and `api_url`. Never add `tenant_id` (the tenant travels inside the token;
+  the server resolves it) or `user_email` (the server resolves identity from
+  the token too).
+- `.fyso/team.json` — **local** (team info, per project directory).
 
 ## Step 0 — Check Etendo dev environment
 
@@ -59,142 +69,283 @@ Ask: **"¿Querés continuar con el sync o pausar para instalar los plugins de Et
 
 If they want to continue anyway, proceed to Step 1. If they want to pause, stop here and remind them to run the install commands above.
 
-## Step 1 — Get the API key
+## Step 1 — Check whether this plugin itself is outdated
 
-First, check if a saved key exists at `~/.fyso/config.json`. If it does, read it and use the stored `token` and `tenant_id` values. Tell the user you found saved credentials and ask if they want to use them or enter new ones.
+Plugin auto-update exists in Claude Code but is opt-in, so some users will be
+sitting on an old build without knowing it. This check is best-effort and
+never blocks the rest of the flow — if it can't reach the network, say
+nothing and move on.
 
-If no saved config exists, ask the user for their **Token** (Bearer token for API access).
+```bash
+python3 -c "
+import json, os, urllib.request
 
-Tell the user:
+plugin_root = os.environ.get('CLAUDE_PLUGIN_ROOT', os.getcwd())
+local_version = ''
+try:
+    with open(os.path.join(plugin_root, '.claude-plugin', 'plugin.json')) as f:
+        local_version = json.load(f).get('version', '')
+except Exception:
+    pass
 
-> Para obtener tu token, andá a https://agent-ui-sites.fyso.dev/ , ingresá con tu email y contraseña, y copiá el token que aparece en pantalla.
+remote_version = ''
+try:
+    url = 'https://raw.githubusercontent.com/etendosoftware/fyso-team-sync/main/.claude-plugin/plugin.json'
+    with urllib.request.urlopen(url, timeout=3) as resp:
+        remote_version = json.load(resp).get('version', '')
+except Exception:
+    pass
 
-The tenant ID is always `fyso-world-fcecd`. Do NOT ask the user for it.
+def parts(v):
+    try:
+        return tuple(int(x) for x in v.split('.'))
+    except Exception:
+        return None
 
-The API URL is always `https://api.fyso.dev`. Do NOT ask the user for it.
+lp, rp = parts(local_version), parts(remote_version)
+outdated = bool(lp and rp and rp > lp)
 
-## Step 2 — Save global credentials
+print('local_version=' + local_version)
+print('remote_version=' + remote_version)
+print('outdated=' + str(outdated))
+"
+```
 
-Save to `~/.fyso/config.json` (global, user-level):
+If `outdated=True`, tell the user before continuing:
+
+> Estás corriendo fyso-team-sync v{local_version}, pero la última versión publicada es v{remote_version}. La actualización automática de plugins es opcional, así que puede que la tuya no se haya actualizado sola. Corré `/plugin update fyso-team-sync` (o esperá al próximo reinicio si tenés auto-update activado) cuando puedas.
+
+If the check fails (no network, parse error, missing fields) just continue silently — do not mention it to the user.
+
+## Step 2 — Get the connection info
+
+This skill can be invoked two ways.
+
+### A) Invoked with arguments: `/sync-team <origin> <token>`
+
+The onboarding screen "Conectar mis agentes" in fyso-business gives the user
+a copyable block with exactly this form. `<origin>` is the instance's base
+URL (e.g. `https://acme.fyso-business.com`) and `<token>` is their personal
+token (`fyb_<tenant>_<hex>`). Use these two values directly — they always
+take priority over whatever is saved. Continue to Step 3.
+
+### B) Invoked with no arguments
+
+Check whether `~/.fyso/config.json` exists and has both `token` and
+`api_url`.
+
+- **If it does**: tell the user you're using the saved connection (mention
+  the `api_url` so they know which instance) and skip straight to Step 4 —
+  do not touch the config file, do not re-register the MCP server, do not
+  ask for confirmation.
+- **If it doesn't** (missing, empty, or missing either key): explain where
+  to get the command instead of asking for a token directly:
+
+  > Para conectar tus agentes, abrí fyso-business y andá a la pantalla "Conectar mis agentes". Ahí vas a encontrar un comando para copiar con la forma `/sync-team <origin> <token>`. Pegalo acá para conectar.
+
+  Stop here and wait — do not proceed without a valid origin/token pair.
+
+## Step 3 — Save credentials and register the MCP server
+
+Only runs when Step 2 produced a **new** origin/token pair (path A above, or
+path B after the user pastes the command). Skip entirely when reusing a
+saved config.
+
+### 3a — Save the global config
 
 ```bash
 mkdir -p ~/.fyso
 ```
 
-Write the file with the Write tool:
+Write `~/.fyso/config.json` with the Write tool, **exactly these two keys**:
 
 ```json
 {
   "token": "{TOKEN}",
-  "tenant_id": "fyso-world-fcecd",
-  "api_url": "https://api.fyso.dev",
-  "user_email": "{EMAIL_IF_KNOWN}",
-  "saved_at": "{ISO_TIMESTAMP}"
+  "api_url": "{ORIGIN}"
 }
 ```
 
-If you can validate the token by calling `GET /api/auth/me`, do it and save the `user_email`. If the endpoint returns an error, skip it and save without email.
+No `tenant_id`, no `user_email`, no `saved_at` — nothing else. If a config
+already existed at a different `api_url`, mention that you're replacing the
+old connection.
 
-## Step 3 — List teams
+### 3b — Ask the MCP scope
 
-Fetch all teams:
+Ask the user where to register the `fyso` MCP server, offering exactly two
+options:
 
+- **`user`** (recommended, default if they don't have a preference):
+  available in every project.
+- **`local`**: only in the current project. If they pick this, tell them
+  explicitly: **la telemetría de uso se sigue mandando desde todos los
+  proyectos igual** — los hooks del plugin son globales, "local" solo acota
+  el acceso MCP, no la telemetría.
+
+**Do not offer `project` scope.** If the user asks for it, decline and
+explain why: that scope writes an `.mcp.json` file meant to be committed and
+shared with the whole team. A personal token in there ends up in git
+history, and revoking the token later doesn't remove it from history —
+that's a credential leak, not a style choice.
+
+### 3c — Register it
+
+Check if a `fyso` MCP server is already registered:
+
+```bash
+claude mcp list
 ```
-curl -s "https://api.fyso.dev/api/entities/teams/records" \
-  -H "Authorization: Bearer {TOKEN}" \
-  -H "X-Tenant-ID: fyso-world-fcecd"
+
+If one is already there, remove it first so the new token replaces the old
+one cleanly:
+
+```bash
+claude mcp remove fyso
 ```
 
-Parse the JSON response. The records are in `data.items`. Each team has at least `id`, `name`, and optionally `prompt` and `version`.
+Then add it with the chosen scope:
 
-**Important**: The API response may include an internal field `_record_version` (number of times the record was modified). Do NOT use this. The team's changelog version is in the `version` field.
+```bash
+claude mcp add --transport http fyso {ORIGIN}/api/mcp --header "Authorization: Bearer {TOKEN}" --scope {SCOPE}
+```
 
-## Step 4 — Let the user pick a team
+Report the command's outcome to the user.
 
-Present the list of teams to the user in a numbered list, showing each team's name. Ask them to pick one by number or name. Wait for their response before continuing.
+## Step 4 — Confirm the MCP tools are reachable
 
-Save the selected team info to `.fyso/team.json` in the **current working directory** (local, per project):
+Try calling the `listar_equipos` tool (see Step 5). If it isn't available in
+this session yet — the connection was just registered in Step 3 and hasn't
+been picked up — tell the user:
+
+> Registré la conexión MCP, pero esta sesión todavía no la tiene activa. Reconectá con `/mcp` (o abrí una sesión nueva) y volvé a correr `/sync-team`.
+
+and stop here. This is expected the very first time; a saved config that was
+already in use (Step 2 path B, existing config) should not hit this.
+
+## Step 5 — List teams
+
+Call the `listar_equipos` tool (no parameters). It returns the teams visible
+to this token: `id`, `nombre`, `slug`, `descripcion`, `version`,
+`departamentos_ids`.
+
+If the list is empty, tell the user there are no teams visible for their
+token and stop.
+
+Present the teams in a numbered list (name + slug). Ask the user to pick one
+by number, name, or slug. Wait for their response before continuing.
+
+## Step 6 — Fetch the selected team
+
+Call the `obtener_equipo` tool with `equipo_id` set to the selected team's
+`id`. It returns `{ equipo, agentes, skills, changelog }`:
+
+- `equipo` — also carries `prompt`: the team's prompt text, meant to be
+  written into the project's `.claude/CLAUDE.md` on sync (see Step 8).
+- `agentes` — in composition order, each with `nombre`, `nombre_visible`,
+  `rol`, `soul`, `system_prompt`, `avatar`, `estado`.
+- `skills` — each with `name`, `description`, `content` (same shape as
+  before).
+- `changelog` — version history entries for the team.
+
+**If the tool responds `not_found`**: treat this exactly the same whether
+the team doesn't exist or is out of scope for this token — the tool
+deliberately doesn't distinguish the two, so a mismatched team can't be
+confirmed to exist. Tell the user:
+
+> No encontré ese equipo.
+
+Never say "no tenés permiso" or anything that confirms the team's existence.
+Offer to go back to Step 5's list.
+
+## Step 7 — Save local team info and surface what changed
+
+Before overwriting it, check if `.fyso/team.json` already exists in the
+current working directory and read its `version` (this is a resync).
 
 ```bash
 mkdir -p .fyso
 ```
 
+Write `.fyso/team.json`:
+
 ```json
 {
-  "team_id": "{TEAM_ID}",
-  "team_name": "{TEAM_NAME}",
-  "version": {TEAM_VERSION_FIELD_OR_0},
+  "team_id": "{equipo.id}",
+  "team_name": "{equipo.nombre}",
+  "version": {equipo.version, or 0 if absent/null},
   "synced_at": "{ISO_TIMESTAMP}"
 }
 ```
 
-Where `{TEAM_VERSION_FIELD_OR_0}` is the value of the team's `version` field (e.g. `1`, `2`, `3`). Use `0` if the field is absent or null. **Do not use `_record_version`** — that is an internal system counter, not the changelog version.
+If this was a resync and `changelog` has entries newer than the previous
+local `version`, show them to the user as "novedades desde tu última
+sincronización" before moving on. If there was no previous `team.json`, or
+the changelog has nothing newer, skip this.
 
-## Step 5 — Write team prompt to CLAUDE.md
+## Step 8 — Write the team prompt to CLAUDE.md
 
-If the selected team has a `prompt` field (non-empty), write it to `.claude/CLAUDE.md` in the current working directory. If the file already exists, replace the section between `<!-- FYSO TEAM START -->` and `<!-- FYSO TEAM END -->` markers. If no markers exist, append the section at the end.
+If `equipo.prompt` is non-empty, write it to `.claude/CLAUDE.md` in the
+current working directory. If the file already exists, replace the section
+between `<!-- FYSO TEAM START -->` and `<!-- FYSO TEAM END -->` markers so a
+resync replaces the block instead of accumulating copies. If no markers
+exist yet, append the section at the end of the file.
 
-The format is:
+Format:
 
 ```markdown
 <!-- FYSO TEAM START -->
-{team prompt content}
+{equipo.prompt}
 <!-- FYSO TEAM END -->
 ```
 
-If the team has no prompt, skip this step and inform the user.
+If `equipo.prompt` is empty, skip this step and say so in the final report.
 
-## Step 6 — Fetch team agents
+## Step 9 — Filter agents by `estado` and clean existing files
 
-Using the selected team's `id`, fetch the agents assigned to that team:
+`estado` is a hand-curated label (not telemetry) with three known values:
+`activo`, `inactivo`, `retirado`. Split `agentes` into two groups:
 
-```
-curl -s "https://api.fyso.dev/api/entities/team_agents/records?resolve=true&filter.team={TEAM_ID}" \
-  -H "Authorization: Bearer {TOKEN}" \
-  -H "X-Tenant-ID: fyso-world-fcecd"
-```
+- **To sync**: `estado` is `"activo"`, or missing/empty, or anything other
+  than the two values below — when in doubt, sync. Missing an agent someone
+  expected is worse than syncing one extra.
+- **Omit**: `estado` is exactly `"inactivo"` or `"retirado"`.
 
-The response contains records where each entry has an `_agent` field (resolved to a full agent object because of `resolve=true`). Extract the agent details from each record. Key fields on each agent:
-
-- `name` — slug/identifier
-- `display_name` — human-readable name
-- `role` — the agent's role (developer, qa, reviewer, coordinator, writer, security, etc.)
-- `soul` — the agent's soul text (personality and principles)
-- `system_prompt` — the agent's system prompt (instructions, rules, workflow)
-
-If any field is missing, use a sensible default (empty string for text fields, "assistant" for role).
-
-## Step 7 — Clean existing agent files
-
-Before creating new files, remove any existing agent files that will be overwritten. For each agent from the API response, check if `.claude/agents/{name}.md` already exists and delete it:
+Then, for **every** agent returned in `agentes` — both groups, not just the
+ones you're about to (re)write — check if `.claude/agents/{nombre}.md`
+already exists and delete it:
 
 ```bash
-rm -f .claude/agents/{name}.md
+rm -f .claude/agents/{nombre}.md
 ```
 
-This ensures a clean sync without stale data from previous runs.
+Deleting for the omitted group too, not only the ones being recreated, is
+what makes retirement actually stick: an agent pulled from the team's
+catalog (curated via ADR 0028) stops showing up locally instead of
+surviving as a stale file from a previous sync. Keep the list of omitted
+agents (name + estado) — you'll need it for Step 12's report.
 
-## Step 8 — Create agent files
+## Step 10 — Create agent files
 
-First, ensure the `.claude/agents/` directory exists in the current working directory:
+Ensure the directory exists:
 
-```
+```bash
 mkdir -p .claude/agents
 ```
 
-For each agent, create a file at `.claude/agents/{name}.md` where `{name}` is the agent's `name` field (the slug). Use the Write tool to create each file with this exact format:
+For each agent in the **to sync** group from Step 9, create
+`.claude/agents/{nombre}.md` with the Write tool, in this exact format:
 
 ```markdown
 ---
-name: {name}
-description: {role} -- {display_name}. {first_line_of_soul}
+name: {nombre}
+description: {rol} -- {nombre_visible}. {first_line_of_soul}
 tools: Read, Write, Edit, Bash, Grep, Glob
 color: {color}
 ---
 
-# {display_name}
+# {nombre_visible}
 
-**Role:** {role}
+**Role:** {rol}
 
 ## Soul
 {soul}
@@ -203,9 +354,12 @@ color: {color}
 {system_prompt}
 ```
 
-IMPORTANT: Include the FULL content of `soul` and `system_prompt` fields. Do NOT truncate, summarize, or abbreviate them. These are the agent's complete instructions and must be preserved exactly as received from the API.
+IMPORTANT: Include the FULL content of `soul` and `system_prompt`. Do NOT
+truncate, summarize, or abbreviate them — these are the agent's complete
+instructions.
 
-Map the `color` field based on the agent's role using these rules:
+Map `color` from `rol` using these rules (case-insensitive, partial match —
+e.g. "Senior Developer" matches "developer"):
 
 | Role contains | Color  |
 |---------------|--------|
@@ -218,37 +372,24 @@ Map the `color` field based on the agent's role using these rules:
 | triage        | orange |
 | (anything else) | gray |
 
-The match should be case-insensitive and partial (e.g. "Senior Developer" matches "developer" and gets green).
+For `first_line_of_soul`: the first non-empty line of `soul`, trimmed. If
+`soul` is empty, use `nombre_visible` instead.
 
-For `first_line_of_soul`: take the first non-empty line of the `soul` field, trimmed. If soul is empty, use the display_name instead.
+`avatar` is returned by the tool but left unused — there's no defined use
+for it in the local file, so don't invent one.
 
-## Step 9 — Fetch team skills
+## Step 11 — Create skill files
 
-Using the selected team's `id`, fetch the skills assigned to that team:
+If `skills` is empty, skip to Step 12 and note that no skills were found.
 
-```
-curl -s "https://api.fyso.dev/api/entities/team_skills/records?filter.team={TEAM_ID}" \
-  -H "Authorization: Bearer {TOKEN}" \
-  -H "X-Tenant-ID: fyso-world-fcecd"
-```
-
-The response contains records in `data.items`. Each skill has:
-
-- `name` — slug/identifier (e.g. `git-workflow`)
-- `description` — one-line summary (may be empty)
-- `content` — full body in Markdown
-
-If the response returns zero items, skip to Step 11 and note that no skills were found.
-
-## Step 10 — Create skill files
-
-First, ensure the `.claude/skills/` directory exists in the current working directory:
+Ensure the directory exists:
 
 ```bash
 mkdir -p .claude/skills
 ```
 
-For each skill, delete any existing file with the same name and create a new one at `.claude/skills/{name}.md`. Use the Write tool with this exact format:
+For each skill, delete any existing file with the same name and create a
+new one at `.claude/skills/{name}.md` with the Write tool:
 
 ```markdown
 ---
@@ -259,20 +400,35 @@ description: {description}
 {content}
 ```
 
-If `description` is empty, write an empty string for that field (keep the frontmatter key).
+If `description` is empty, keep the frontmatter key with an empty string.
 
-IMPORTANT: Include the FULL `content` field exactly as received from the API. Do NOT truncate, summarize, or modify it.
+IMPORTANT: Include the FULL `content` field exactly as received. Do NOT
+truncate, summarize, or modify it.
 
-## Step 11 — Report results
+## Step 12 — Report results
 
-After creating all files, print a summary:
+Print a summary covering:
 
-- Whether the team prompt was written to `.claude/CLAUDE.md`
-- How many agent files were created, with their full paths
-- How many skill files were created, with their full paths (or "no skills found" if none)
-- That global credentials were saved to `~/.fyso/config.json`
-- That team info was saved to `.fyso/team.json` (including the current version)
-- A reminder that the user can now use these agents as subagents in Claude Code via the Task tool or by referencing them
-- A note that at the start of each future session, Claude Code will automatically check if the team has a new version and notify the user to re-sync if needed
+- Whether a plugin-update notice was shown in Step 1.
+- Whether this run saved new global credentials / registered the MCP server,
+  or reused an existing saved connection.
+- The MCP scope chosen (and, if `local`, the reminder that telemetry still
+  goes out from every project).
+- Whether the team prompt was written to `.claude/CLAUDE.md` (Step 8).
+- How many agent files were created, with their full paths, **and** how
+  many were omitted for not being `activo`, broken down by `estado`
+  (e.g. "2 omitidos: 1 inactivo, 1 retirado") — never silently drop them
+  from the count, so it doesn't look like agents went missing.
+- How many skill files were created, with their full paths (or "no skills
+  found" if none).
+- That team info was saved to `.fyso/team.json`, including the current
+  version, and any changelog news surfaced in Step 7.
+- A reminder that the user can now use these agents as subagents via the
+  Task tool or by referencing them.
+- A note that at the start of each future session, Claude Code will
+  automatically check if the team has a new version and notify the user to
+  re-sync if needed.
 
-If no agents were found for the selected team, inform the user and suggest they check the team configuration in the Fyso dashboard at https://agent-ui-sites.fyso.dev.
+If no agents were found for the selected team (or all were omitted by
+`estado`), inform the user and suggest they check the team configuration in
+fyso-business.

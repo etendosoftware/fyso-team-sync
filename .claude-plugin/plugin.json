@@ -1,12 +1,12 @@
 {
   "name": "fyso-team-sync",
-  "version": "3.4.5",
+  "version": "4.0.0",
   "description": "Sync Fyso agent teams to local .claude/agents/",
   "author": {
     "name": "Fyso",
     "url": "https://github.com/fyso-dev"
   },
-  "repository": "https://github.com/fyso-dev/fyso-team-sync",
+  "repository": "https://github.com/etendosoftware/fyso-team-sync",
   "license": "MIT",
   "skills": "./skills/"
 }
