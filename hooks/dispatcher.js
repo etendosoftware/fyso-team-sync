@@ -46,6 +46,7 @@ const ACCOUNT_CACHE_FALLBACK_TTL_MS = 5 * 60 * 1000; // used only when credentia
 const REPO_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const SESSION_PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_STALE_MS = 10 * 1000;
+const TRANSCRIPT_TAIL_READ_BYTES = 20000; // shared with the usage-limit tail read below
 
 const USAGE_LIMIT_KEYWORDS = [
   'usage limit reached', 'out of extra usage', "you've reached your usage",
@@ -257,6 +258,10 @@ async function handleTrackingEvent() {
   const hookCwd = hook.cwd || process.cwd();
   const agentId = hook.agent_id || '';
   const agentType = hook.agent_type || '';
+  // Only present on SubagentStop (verified against a real payload) — the
+  // subagent's own transcript, as opposed to `transcriptPath` above, which is
+  // always the orchestrator session's.
+  const agentTranscriptPath = hook.agent_transcript_path || '';
 
   let sessionId = hook.session_id || '';
   if (!sessionId) {
@@ -386,7 +391,43 @@ async function handleTrackingEvent() {
     else if (errType === 'overloaded_error') actualEvent = 'overloaded_hit';
   }
 
-  if (!model) model = 'claude-opus-4-6';
+  // ── Model for subagent-dispatch events: never the orchestrator's ─────────
+  // `model` above (from scanTranscript(transcriptPath)) is the ORCHESTRATOR
+  // session's model. That's correct for session_start/session_update/
+  // usage_limit_hit, but a subagent can run on a different model than
+  // whoever dispatched it — tagging it with the orchestrator's model
+  // mis-tarifies the whole event (verified live: a "ui-app" dispatch that
+  // ran end-to-end on claude-sonnet-5 got reported as claude-opus-5 because
+  // this code read the main session's transcript instead of the subagent's).
+  //
+  // For these three event types we either read the real source or leave
+  // `model` unset — never guess. `clean()` in sendUsageEvent drops undefined
+  // fields, so an unset model here means the event goes out without one; the
+  // server already treats an unknown model as "cost not computed" rather
+  // than inventing a price, and an absent cost is honest where a wrong one
+  // contaminates totals.
+  if (EVENT_TYPE === 'agent_dispatch') {
+    // Fired synchronously right after the Task tool call returns (PostToolUse,
+    // matcher "Agent") — before the subagent has necessarily produced any
+    // transcript of its own, so there's nothing on disk to read yet. Claude
+    // Code already resolved the model for us: it's in this same event's
+    // tool_response (verified against a real payload), so no extra file read
+    // is needed at all.
+    model = toolResponse.resolvedModel || undefined;
+  } else if (EVENT_TYPE === 'subagent_start') {
+    // SubagentStop carries agent_transcript_path; SubagentStart does not
+    // (verified against a real payload) — and unlike agent_dispatch, this is
+    // a native hook event with no tool_response to fall back on either. There
+    // is no trustworthy source for the subagent's model yet at this point in
+    // its lifecycle. Sending the session's model here would be the exact bug
+    // this fix removes, just moved earlier — so it's left unset instead;
+    // subagent_stop reports the real one once the transcript exists.
+    model = undefined;
+  } else if (EVENT_TYPE === 'subagent_stop') {
+    model = resolveSubagentModel(agentTranscriptPath) || undefined;
+  } else if (!model) {
+    model = 'claude-opus-4-6';
+  }
 
   // detail: dropped entirely for a plain session_update (conversation text,
   // not metadata); kept as a short summary when promoted to usage_limit_hit
@@ -512,18 +553,7 @@ async function handleCheckPrevLimit() {
 
     let tailLines = [];
     try {
-      const fsize = stat.size;
-      const readSize = Math.min(fsize, 20000);
-      const fd = fs.openSync(tf, 'r');
-      const buf = Buffer.alloc(readSize);
-      fs.readSync(fd, buf, 0, readSize, fsize - readSize);
-      fs.closeSync(fd);
-      let text = buf.toString('utf8');
-      if (fsize > 20000) {
-        const nl = text.indexOf('\n');
-        text = nl >= 0 ? text.slice(nl + 1) : text;
-      }
-      tailLines = text.split('\n').filter(Boolean);
+      tailLines = readTailLines(tf, TRANSCRIPT_TAIL_READ_BYTES);
     } catch (e) { continue; }
 
     let matched = false;
@@ -916,6 +946,53 @@ function scanTranscript(transcriptPath, opts) {
   result.totals.total = result.totals.input + result.totals.output
     + result.totals.cacheCreation + result.totals.cacheRead;
   return result;
+}
+
+// Reads the last `maxBytes` of a file and returns it split into non-empty
+// lines, dropping the first line when the file was truncated (it's likely a
+// partial JSON line). Throws if the file is missing/unreadable — callers
+// catch, same contract as the rest of this section's transcript readers.
+function readTailLines(filePath, maxBytes) {
+  const size = fs.statSync(filePath).size;
+  const readSize = Math.min(size, maxBytes);
+  const fd = fs.openSync(filePath, 'r');
+  const buf = Buffer.alloc(readSize);
+  fs.readSync(fd, buf, 0, readSize, size - readSize);
+  fs.closeSync(fd);
+  let text = buf.toString('utf8');
+  if (size > maxBytes) {
+    const nl = text.indexOf('\n');
+    text = nl >= 0 ? text.slice(nl + 1) : text;
+  }
+  return text.split('\n').filter(Boolean);
+}
+
+// Returns the last `message.model` seen in a subagent's own transcript, or
+// '' if it's missing, unreadable, or its tail holds no model at all (e.g. the
+// window landed entirely inside one huge tool_result with no assistant
+// message boundary). A subagent runs on one model for its whole transcript,
+// so unlike scanTranscript (which scans the full file for running token
+// totals) this only needs *a* model line, not all of them — reading just the
+// tail avoids parsing what can be multi-MB subagent transcripts inside the
+// hook's own ~5s foreground budget. Measured against real transcripts on
+// this machine: a 12.4MB file took ~100ms to read in full vs ~0.1ms for the
+// last 20KB.
+function resolveSubagentModel(agentTranscriptPath) {
+  if (!agentTranscriptPath) return '';
+  let lines;
+  try {
+    lines = readTailLines(agentTranscriptPath, TRANSCRIPT_TAIL_READ_BYTES);
+  } catch (e) { return ''; }
+
+  let model = '';
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      const msg = entry.message;
+      if (msg && typeof msg === 'object' && msg.model) model = msg.model;
+    } catch (e) {}
+  }
+  return model;
 }
 
 function buildActivityDetail(scan) {
