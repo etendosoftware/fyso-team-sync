@@ -239,6 +239,8 @@ by number, name, or slug. Wait for their response before continuing.
 Call the `obtener_equipo` tool with `equipo_id` set to the selected team's
 `id`. It returns `{ equipo, agentes, skills, changelog }`:
 
+- `equipo` — also carries `prompt`: the team's prompt text, meant to be
+  written into the project's `.claude/CLAUDE.md` on sync (see Step 8).
 - `agentes` — in composition order, each with `nombre`, `nombre_visible`,
   `rol`, `soul`, `system_prompt`, `avatar`, `estado`.
 - `skills` — each with `name`, `description`, `content` (same shape as
@@ -280,19 +282,49 @@ local `version`, show them to the user as "novedades desde tu última
 sincronización" before moving on. If there was no previous `team.json`, or
 the changelog has nothing newer, skip this.
 
-## Step 8 — Clean existing agent files
+## Step 8 — Write the team prompt to CLAUDE.md
 
-Before creating new files, remove any existing agent files that will be
-overwritten. For each agent from `agentes`, check if
-`.claude/agents/{nombre}.md` already exists and delete it:
+If `equipo.prompt` is non-empty, write it to `.claude/CLAUDE.md` in the
+current working directory. If the file already exists, replace the section
+between `<!-- FYSO TEAM START -->` and `<!-- FYSO TEAM END -->` markers so a
+resync replaces the block instead of accumulating copies. If no markers
+exist yet, append the section at the end of the file.
+
+Format:
+
+```markdown
+<!-- FYSO TEAM START -->
+{equipo.prompt}
+<!-- FYSO TEAM END -->
+```
+
+If `equipo.prompt` is empty, skip this step and say so in the final report.
+
+## Step 9 — Filter agents by `estado` and clean existing files
+
+`estado` is a hand-curated label (not telemetry) with three known values:
+`activo`, `inactivo`, `retirado`. Split `agentes` into two groups:
+
+- **To sync**: `estado` is `"activo"`, or missing/empty, or anything other
+  than the two values below — when in doubt, sync. Missing an agent someone
+  expected is worse than syncing one extra.
+- **Omit**: `estado` is exactly `"inactivo"` or `"retirado"`.
+
+Then, for **every** agent returned in `agentes` — both groups, not just the
+ones you're about to (re)write — check if `.claude/agents/{nombre}.md`
+already exists and delete it:
 
 ```bash
 rm -f .claude/agents/{nombre}.md
 ```
 
-This ensures a clean sync without stale data from previous runs.
+Deleting for the omitted group too, not only the ones being recreated, is
+what makes retirement actually stick: an agent pulled from the team's
+catalog (curated via ADR 0028) stops showing up locally instead of
+surviving as a stale file from a previous sync. Keep the list of omitted
+agents (name + estado) — you'll need it for Step 12's report.
 
-## Step 9 — Create agent files
+## Step 10 — Create agent files
 
 Ensure the directory exists:
 
@@ -300,8 +332,8 @@ Ensure the directory exists:
 mkdir -p .claude/agents
 ```
 
-For each agent in `agentes`, create `.claude/agents/{nombre}.md` with the
-Write tool, in this exact format:
+For each agent in the **to sync** group from Step 9, create
+`.claude/agents/{nombre}.md` with the Write tool, in this exact format:
 
 ```markdown
 ---
@@ -343,12 +375,12 @@ e.g. "Senior Developer" matches "developer"):
 For `first_line_of_soul`: the first non-empty line of `soul`, trimmed. If
 `soul` is empty, use `nombre_visible` instead.
 
-`avatar` and `estado` are returned by the tool but not used in the generated
-file — they're informational metadata, not part of the subagent spec.
+`avatar` is returned by the tool but left unused — there's no defined use
+for it in the local file, so don't invent one.
 
-## Step 10 — Create skill files
+## Step 11 — Create skill files
 
-If `skills` is empty, skip to Step 11 and note that no skills were found.
+If `skills` is empty, skip to Step 12 and note that no skills were found.
 
 Ensure the directory exists:
 
@@ -373,7 +405,7 @@ If `description` is empty, keep the frontmatter key with an empty string.
 IMPORTANT: Include the FULL `content` field exactly as received. Do NOT
 truncate, summarize, or modify it.
 
-## Step 11 — Report results
+## Step 12 — Report results
 
 Print a summary covering:
 
@@ -382,7 +414,11 @@ Print a summary covering:
   or reused an existing saved connection.
 - The MCP scope chosen (and, if `local`, the reminder that telemetry still
   goes out from every project).
-- How many agent files were created, with their full paths.
+- Whether the team prompt was written to `.claude/CLAUDE.md` (Step 8).
+- How many agent files were created, with their full paths, **and** how
+  many were omitted for not being `activo`, broken down by `estado`
+  (e.g. "2 omitidos: 1 inactivo, 1 retirado") — never silently drop them
+  from the count, so it doesn't look like agents went missing.
 - How many skill files were created, with their full paths (or "no skills
   found" if none).
 - That team info was saved to `.fyso/team.json`, including the current
@@ -393,5 +429,6 @@ Print a summary covering:
   automatically check if the team has a new version and notify the user to
   re-sync if needed.
 
-If no agents were found for the selected team, inform the user and suggest
-they check the team configuration in fyso-business.
+If no agents were found for the selected team (or all were omitted by
+`estado`), inform the user and suggest they check the team configuration in
+fyso-business.
