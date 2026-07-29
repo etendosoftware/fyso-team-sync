@@ -135,6 +135,7 @@ async function handleHeartbeatRun() {
       teamName: teamName || undefined,
       sessionId,
       model: scan.model || undefined,
+      sessionModel: scan.model || undefined,
       cwd: cwd || undefined,
       tokensNow: scan.totals,
       timestamp: new Date().toISOString(),
@@ -323,6 +324,9 @@ async function handleTrackingEvent() {
       limitResetAt: resetAt,
       sessionId,
       model,
+      // Not `model`: that one falls back to a hardcoded default above, and the
+      // session accumulators are better left unpriced than priced on a guess.
+      sessionModel: scan.model || undefined,
       cwd: hookCwd,
       tokensNow: scan.totals,
       forceAccountRefresh: true,
@@ -352,6 +356,8 @@ async function handleTrackingEvent() {
       limitResetAt: resetAt,
       sessionId,
       model,
+      // Same reasoning as stop_failure above: no guessed model prices a session.
+      sessionModel: scan.model && scan.model !== '<synthetic>' ? scan.model : undefined,
       cwd: hookCwd,
       tokensNow: scan.totals,
       forceAccountRefresh: true,
@@ -368,6 +374,18 @@ async function handleTrackingEvent() {
 
   const scan = scanTranscript(transcriptPath, { collectDetail: needsCollectDetail, detailWindow: 50 });
   let model = scan.model;
+  // The session's own model, captured before the dispatch-event overrides
+  // below can replace `model` with a subagent's. It travels as its own field
+  // because the two answer different questions: `model` prices THIS event's
+  // tokens, `session_model` prices the `session_*` accumulators, which belong
+  // to the session no matter which subagent happened to report them.
+  //
+  // Without it the server priced a whole Opus session at Sonnet rates whenever
+  // the last event came from a Sonnet subagent — and since the period total is
+  // built from the GROWTH of that session cost, each segment ended up measured
+  // on a different scale (measured in production: US$ 166 reported for a
+  // session that really cost about US$ 415).
+  const sessionModel = scan.model || undefined;
 
   let actualEvent = EVENT_TYPE;
 
@@ -470,6 +488,7 @@ async function handleTrackingEvent() {
     teamName: teamName || undefined,
     sessionId,
     model,
+    sessionModel,
     messageId: messageId || undefined,
     cwd: hookCwd,
     tokensNow: scan.totals,
@@ -683,6 +702,9 @@ async function sendUsageEvent(raw) {
       claude_account: claudeAccount || undefined,
       session_id: sid || undefined,
       model: raw.model,
+      // Prices the session_* accumulators below; `model` prices this event's
+      // own tokens. See where it's captured in handleTrackingEvent.
+      session_model: raw.sessionModel,
       message_id: raw.messageId,
       // Delta since the last successfully-reported marker for this session —
       // replaces the old "per-event tokens" (which were non-zero only for
