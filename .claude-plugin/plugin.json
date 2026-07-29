@@ -6,7 +6,7 @@
     "name": "Fyso",
     "url": "https://github.com/fyso-dev"
   },
-  "repository": "https://github.com/fyso-dev/fyso-team-sync",
+  "repository": "https://github.com/etendosoftware/fyso-team-sync",
   "license": "MIT",
   "skills": "./skills/"
 }
