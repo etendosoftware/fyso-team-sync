@@ -34,24 +34,33 @@ claude --plugin-dir /path/to/fyso-team-sync
 
 ## Usage
 
-In any Claude Code session, run:
+Open the "Conectar mis agentes" screen in fyso-business — it gives you a
+copyable command with this form:
 
 ```
-/sync-team
+/sync-team <origin> <token>
 ```
 
-You will be prompted for:
+where `<origin>` is your fyso-business instance's base URL and `<token>` is
+your personal token (`fyb_<tenant>_<hex>`). Paste it into any Claude Code
+session. The skill saves the connection to `~/.fyso/config.json`, registers
+the `fyso` MCP server (asking you whether to scope it to `user`, available
+in every project, or `local`, just this one — project scope is never
+offered, since it would commit a personal token into `.mcp.json`), then
+reads your visible teams over that MCP connection and lets you pick one.
 
-- **Token** (Bearer token for API access)
-- **Tenant ID** (your tenant slug)
+Once connected, you can just run `/sync-team` with no arguments in later
+sessions or other projects — it reuses the saved connection.
 
-Then pick a team from the list. The plugin creates `.claude/agents/` files in your current working directory.
+The plugin creates `.claude/agents/` and `.claude/skills/` files in your
+current working directory.
 
 ## Requirements
 
-- A Fyso account with access to a tenant
+- A Fyso Business account with a personal token
 - At least one team configured with agents assigned
-- Network access to the Fyso API
+- Network access to your fyso-business instance (for the MCP connection and
+  the usage telemetry the hooks send)
 
 ## Generated file format
 
