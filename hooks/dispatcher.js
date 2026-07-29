@@ -14,6 +14,13 @@
 // can take longer than that. The foreground path only reads local files
 // (transcript, config) and hands off a small JSON blob to the background
 // sender before returning.
+//
+// A 401/403 on that POST means the personal token is dead (revoked, or
+// replaced by a newer one) — unlike a network error, retrying won't help, so
+// sendUsageEvent records it in session-state.json (`connection.broken`) and
+// team_update_check (the only path that talks to the user, on every
+// UserPromptSubmit) surfaces it once per session via warnIfConnectionBroken,
+// taking priority over the plugin-version notice below it.
 'use strict';
 
 const path = require('path');
@@ -150,6 +157,15 @@ async function handleTeamUpdateCheck() {
   try { hook = JSON.parse(stdinData); } catch (e) {}
 
   const sessionId = hook.session_id || '';
+
+  // Broken-credential warning takes priority over (and, while active,
+  // suppresses) the team-version check below: it has its own dedup, checked
+  // first and on every prompt, precisely because a token can die mid-session
+  // — after this session's version-check flag (right below) already got set
+  // on an earlier prompt. If we gated this on that same flag, a mid-session
+  // revocation would never surface at all.
+  if (warnIfConnectionBroken(sessionId)) return;
+
   const flagFile = path.join(
     os.tmpdir(),
     sessionId ? `fyso-version-check-${sessionId}` : `fyso-version-check-${process.ppid}`
@@ -190,6 +206,42 @@ async function handleTeamUpdateCheck() {
       );
     }
   } catch (e) { dbg('team_update_check', `error: ${e.message}`); }
+}
+
+// Reads the connection marker sendUsageEvent maintains in session-state.json
+// and, if it shows a *previously working* connection that a 401/403 has since
+// broken, prints a one-line, model-facing warning — same channel/shape as the
+// version-check notice above. Returns whether a broken connection is
+// currently on record (regardless of whether this call actually printed
+// anything), so the caller can skip the version check while it's true.
+//
+// `everConnected` is what tells "never configured / stale api_url that 401s
+// everything" (never true, so we stay quiet — a person who never had a good
+// connection shouldn't be told theirs "stopped working") apart from "had one,
+// it broke" (everConnected true + connection.broken true — worth a warning).
+function warnIfConnectionBroken(sessionId) {
+  const state = readJsonSafe(SESSION_STATE_PATH, {});
+  const conn = state.connection || {};
+  if (!conn.broken || !state.everConnected) return false;
+
+  // Own dedup, separate from the version-check flag above: printed at most
+  // once per session, but checked on every prompt (cheap local read) so a
+  // mid-session revocation is caught on the very next prompt instead of
+  // waiting for a session that hasn't run its version check yet.
+  const warnFlag = path.join(
+    os.tmpdir(),
+    sessionId ? `fyso-conn-broken-warned-${sessionId}` : `fyso-conn-broken-warned-${process.ppid}`
+  );
+  if (fs.existsSync(warnFlag)) return true;
+  try { fs.writeFileSync(warnFlag, ''); } catch (e) {}
+
+  process.stdout.write(
+    '[fyso-team-sync] Tu conexión con fyso-business dejó de funcionar (la credencial fue revocada o reemplazada). ' +
+    'IMPORTANTE: antes de responder al usuario, avisale en una línea que su conexión con fyso-business dejó de ' +
+    'funcionar porque la credencial fue revocada o reemplazada, que puede correr /sync-team para reconectar, y que ' +
+    'mientras tanto no se está registrando el uso de sus agentes.\n'
+  );
+  return true;
 }
 
 // ─── Main tracking path: session_start, agent_dispatch, subagent_start/stop,
@@ -589,10 +641,12 @@ async function sendUsageEvent(raw) {
     dbg(raw.event, `PAYLOAD: ${JSON.stringify(payload)}`);
 
     let ok = false;
+    let statusCode = null;
     try {
       const resp = await postJson(`${cfg.api_url}/api/uso/eventos`, payload, {
         Authorization: `Bearer ${cfg.token}`,
       });
+      statusCode = resp.status;
       ok = resp.status >= 200 && resp.status < 300;
       dbg(raw.event, `RESPONSE: ${resp.status} ${String(resp.body).slice(0, 200)}`);
     } catch (e) {
@@ -610,6 +664,30 @@ async function sendUsageEvent(raw) {
       if (ok) state.sessions[sid].tokens = now;
       state.sessions[sid].updatedAt = new Date().toISOString();
     }
+
+    // Credential vs. network failure: a 401/403 means the personal token
+    // itself is dead (revoked, or replaced by a new one from the "Conectar
+    // mis agentes" screen) — retrying won't fix that, so it's worth telling
+    // the user (via team_update_check, see below). Anything else — a
+    // network error (postJson threw, statusCode stays null) or a
+    // non-auth HTTP status — is treated as transitory and left untouched:
+    // the next event's delta absorbs what this one couldn't report, same
+    // self-healing as always, no retry queue, no user-facing noise.
+    //
+    // `state.everConnected` / `state.connection` are top-level (not per
+    // session), so they survive pruneOldSessions below and let us tell
+    // "never had a working connection" (nothing to warn about — the token
+    // may just not be configured yet, or api_url may be stale) apart from
+    // "had one and it broke".
+    if (ok) {
+      state.everConnected = true;
+      if (state.connection && state.connection.broken) delete state.connection;
+    } else if (statusCode === 401 || statusCode === 403) {
+      if (!state.connection || !state.connection.broken) {
+        state.connection = { broken: true, since: new Date().toISOString(), code: statusCode };
+      }
+    }
+
     pruneOldSessions(state.sessions);
     writeJsonAtomic(SESSION_STATE_PATH, state);
   });
