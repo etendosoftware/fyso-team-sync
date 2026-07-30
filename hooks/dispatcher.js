@@ -532,6 +532,15 @@ async function handleSendEvent() {
 // <synthetic> message matching usage-limit keywords, and reports the first
 // match found as a `usage_limit_hit` for that OLD session. Runs detached so
 // it never counts against the session_start hook's own timeout.
+//
+// This runs from a brand-new session — there's no delta marker for someone
+// else's old session to fall back on — so the matched transcript (`tf`) is
+// re-scanned with scanTranscript for its real totals and model before
+// reporting. Sending zeros/a guessed model here (as this used to) corrupts
+// that OLD session, not this one: zeros as one endpoint of the server's
+// max-min window recount its whole day's usage as a single event, and a
+// wrong model tarifies that recount at the wrong rate — both land on a
+// session this code doesn't own and can't correct afterwards.
 function launchPrevLimitCheck(transcriptPath, sessionId, cwd) {
   const transcriptDir = transcriptPath ? path.dirname(transcriptPath) : '';
   if (!transcriptDir || !fs.existsSync(transcriptDir)) return;
@@ -620,13 +629,20 @@ async function handleCheckPrevLimit() {
     }
 
     if (matched) {
+      // Real numbers for the OLD session, not invented ones — same rule as
+      // stop_failure/usage_limit_check above: no guessed model prices a
+      // session, and here that applies to `model` too (there's no "this
+      // event's own tokens" to price — tokensNow IS the old session's total).
+      const scan = scanTranscript(tf, { collectDetail: false });
+      const safeModel = scan.model && scan.model !== '<synthetic>' ? scan.model : undefined;
       await sendUsageEvent({
         event: 'usage_limit_hit',
         detail: `detected on next session_start: ${matchedText.slice(0, 100)}`,
         sessionId: tfSession,
-        model: 'claude-opus-4-6',
+        model: safeModel,
+        sessionModel: safeModel,
         cwd,
-        tokensNow: { total: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        tokensNow: scan.totals,
         forceAccountRefresh: true,
         timestamp: new Date().toISOString(),
       });
