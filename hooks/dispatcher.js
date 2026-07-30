@@ -532,6 +532,15 @@ async function handleSendEvent() {
 // <synthetic> message matching usage-limit keywords, and reports the first
 // match found as a `usage_limit_hit` for that OLD session. Runs detached so
 // it never counts against the session_start hook's own timeout.
+//
+// This runs from a brand-new session — there's no delta marker for someone
+// else's old session to fall back on — so the matched transcript (`tf`) is
+// re-scanned with scanTranscript for its real totals and model before
+// reporting. Sending zeros/a guessed model here (as this used to) corrupts
+// that OLD session, not this one: zeros as one endpoint of the server's
+// max-min window recount its whole day's usage as a single event, and a
+// wrong model tarifies that recount at the wrong rate — both land on a
+// session this code doesn't own and can't correct afterwards.
 function launchPrevLimitCheck(transcriptPath, sessionId, cwd) {
   const transcriptDir = transcriptPath ? path.dirname(transcriptPath) : '';
   if (!transcriptDir || !fs.existsSync(transcriptDir)) return;
@@ -620,13 +629,32 @@ async function handleCheckPrevLimit() {
     }
 
     if (matched) {
+      // Real numbers for the OLD session, not invented ones — same rule as
+      // stop_failure/usage_limit_check above: no guessed model prices a
+      // session, and here that applies to `model` too (there's no "this
+      // event's own tokens" to price — tokensNow IS the old session's total).
+      const scan = scanTranscript(tf, { collectDetail: false });
+      const safeModel = scan.model && scan.model !== '<synthetic>' ? scan.model : undefined;
+      // This event describes the OLD session (`tf`), not the new one that
+      // just started and triggered this check — so its project/repo have to
+      // come from that old session's own transcript too, never from the new
+      // session's `cwd` (the `cwd` this function received as a parameter).
+      // Before this, `cwd` here was always the new session's, which cost
+      // nothing while tokensNow was zeros (delta = 0 either way) but became a
+      // real misattribution once tokensNow started carrying the old
+      // session's real totals: the queue-death consumption this whole check
+      // exists to catch would get billed to the new session's project
+      // instead of the one that actually spent it. `scan.cwd` is only
+      // available when the transcript has at least one entry carrying it;
+      // fall back to the caller's `cwd` rather than sending an empty one.
       await sendUsageEvent({
         event: 'usage_limit_hit',
         detail: `detected on next session_start: ${matchedText.slice(0, 100)}`,
         sessionId: tfSession,
-        model: 'claude-opus-4-6',
-        cwd,
-        tokensNow: { total: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
+        model: safeModel,
+        sessionModel: safeModel,
+        cwd: scan.cwd || cwd,
+        tokensNow: scan.totals,
         forceAccountRefresh: true,
         timestamp: new Date().toISOString(),
       });
@@ -646,6 +674,12 @@ async function sendUsageEvent(raw) {
   const cfg = readConfig();
   if (!cfg) return;
 
+  // `claudeAccount` always resolves the CURRENT machine session's logged-in
+  // account, even for an event describing an old session (e.g. the
+  // prev-limit check above, whose `raw.cwd`/repo do come from the old
+  // session's own transcript). There's no reliable "account at the time"
+  // signal inside a transcript to read instead, and in practice it's the
+  // same person on the same machine either way — accepted, not overlooked.
   const claudeAccount = await resolveClaudeAccount({ forceRefresh: !!raw.forceAccountRefresh });
   const repo = resolveRepo(raw.cwd);
   const pluginVersion = resolvePluginVersion();
@@ -964,6 +998,7 @@ function scanTranscript(transcriptPath, opts) {
   const collectDetail = !!(opts && opts.collectDetail);
   const result = {
     model: '',
+    cwd: '',
     totals: { total: 0, input: 0, output: 0, cacheCreation: 0, cacheRead: 0 },
     lastText: '',
     toolsUsed: [],
@@ -984,6 +1019,13 @@ function scanTranscript(transcriptPath, opts) {
     const msg = entry.message || {};
     if (typeof msg !== 'object') continue;
     if (msg.model) result.model = msg.model;
+    // `cwd` lives on the entry itself, not inside `message` — same shape
+    // Claude Code uses for every transcript line. Callers scanning a
+    // transcript that belongs to a DIFFERENT session than the caller's own
+    // (see handleCheckPrevLimit) need this to attribute the event to the
+    // right project instead of whichever directory the caller happens to
+    // be running in.
+    if (entry.cwd) result.cwd = entry.cwd;
 
     const u = msg.usage || {};
     const si = u.input_tokens || 0;
